@@ -1,0 +1,21 @@
+[project]
+name = "dist-jax"
+version = "0.1.0"
+description = "Distributed Training with JAX - course notebooks"
+requires-python = ">=3.10"
+dependencies = [
+    "jax[cpu]",
+    "flax",
+    "optax",
+    "numpy",
+]
+
+[dependency-groups]
+dev = [
+    "jupytext",
+    "jupyter",
+    "notebook",
+]
+
+[tool.jupytext]
+formats = "src//py:percent,chapters//ipynb"
