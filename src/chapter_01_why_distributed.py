@@ -17,9 +17,18 @@
 #
 # # Chapter 1: Why Distributed Training?
 #
-# > **Course: Distributed Training — From Concepts to JAX**
+# > **Course: Distributed Training in JAX** — built around JAX + Equinox + Optax + Orbax.
 #
 # ---
+#
+# ## What we build
+#
+# A **model-sizing calculator**: given `(n_layers, hidden, n_heads, seq, batch)`, compute params,
+# training memory, FLOPs/step, and verdict on whether it fits a single GPU. We then watch a
+# transformer hit OOM as we scale it — the empirical "why" of this entire course.
+#
+# **Real-world hook:** sizing a Llama-3 70B run, or noting that Meta's DLRM has embedding tables
+# >10 TB while an H100 has 80 GB. Without distribution, neither model exists on any single device.
 #
 # ## Learning Objectives
 #
@@ -28,7 +37,8 @@
 # - Calculate memory requirements for training a transformer model
 # - Estimate compute (FLOPs) for a training run
 # - Identify when a model fits on a single GPU vs requires multiple GPUs
-# - Name the four main axes of parallelism
+# - Name the parallelism axes used across the rest of the course
+# - Combine the above into a single sizing calculator
 #
 
 # %% [markdown]
@@ -147,27 +157,22 @@
 
 # %% [markdown]
 # ---
-# ## 5. The Four Axes of Parallelism (Preview)
+# ## 5. Parallelism Axes (Preview)
 #
-# ```
-# ┌─────────────────────────────────────────────────────────────┐
-# │                    Distributed Training                      │
-# │                                                              │
-# │  Data Parallelism     Each GPU gets a different mini-batch   │
-# │  (Chapter 2)          Same model on all GPUs                 │
-# │                                                              │
-# │  Tensor Parallelism   Split individual weight matrices       │
-# │  (Chapter 3)          across GPUs                            │
-# │                                                              │
-# │  Pipeline Parallelism Split model layers across GPUs         │
-# │  (Chapter 3)          GPUs process different micro-batches   │
-# │                                                              │
-# │  Sequence Parallelism Split along the sequence dimension     │
-# │  (Chapter 3)          For very long contexts                 │
-# └─────────────────────────────────────────────────────────────┘
-# ```
+# Each axis gets its own implementation chapter later in the course.
 #
-# Real systems (Megatron-LM, DeepSpeed) combine all four — this is **3D parallelism**.
+# | Axis                        | Idea                                                          | Built in |
+# |-----------------------------|---------------------------------------------------------------|----------|
+# | **Data Parallelism (DP)**   | Replicate model, shard the batch.                              | Ch 2     |
+# | **FSDP / ZeRO**             | DP, but shard optimizer state, gradients, and params.          | Ch 4     |
+# | **Tensor Parallelism (TP)** | Split individual weight matrices across devices.               | Ch 5     |
+# | **Embedding Parallelism**   | Row-shard embedding tables (DLRM-style), all-to-all lookups.   | Ch 6     |
+# | **Pipeline Parallelism**    | Split *layers* across devices; micro-batch through the stages. | Ch 7     |
+# | **Sequence Parallelism**    | Shard along the sequence dim (long-context attention).         | Ch 8     |
+# | **Expert Parallelism**      | Shard MoE experts across devices; route tokens via all-to-all. | Ch 12    |
+#
+# Frontier training stacks (MaxText, Megatron-LM, DeepSpeed) **combine** several of these
+# in a single mesh — by Ch 10 we'll wire DP × TP × FSDP × bf16 into one trainer.
 #
 
 # %% [markdown]
@@ -471,6 +476,56 @@ judge.check("Ex4: LLaMA-2 7B training days", result['days'], 3.74, tol=0.05)
 
 # %% [markdown]
 # ---
+# ## Build: The Sizing Calculator
+#
+# Compose Exercises 1–4 into a single function that takes a model+cluster spec and returns
+# a verdict. We'll reach for this in every later chapter to predict whether a configuration
+# will fit before we run it.
+#
+# ```
+# TODO: Implement size_run — compose count_transformer_params, training_memory_gb,
+#       can_train_on_cluster, and estimate_training_time into one report.
+# ```
+#
+
+# %%
+def size_run(
+    *,
+    vocab_size: int,
+    d_model: int,
+    n_layers: int,
+    max_seq_len: int,
+    n_tokens: int,
+    n_gpus: int,
+    gpu_memory_gb: float = 80.0,
+    gpu_tflops: float = 312.0,
+    mfu: float = 0.45,
+) -> dict:
+    """One-stop sizing: params, training memory, fit verdict, training time."""
+    # TODO: call count_transformer_params, training_memory_gb,
+    #       can_train_on_cluster, estimate_training_time and assemble a report dict.
+    return {}
+
+
+# Example: can we train Llama-3 70B on 256 H100s in BF16?
+# (Llama-3 70B: vocab 128_256, d_model 8192, n_layers 80, max_seq 8192,
+#  ~15T training tokens.)
+report = size_run(
+    vocab_size=128_256,
+    d_model=8192,
+    n_layers=80,
+    max_seq_len=8192,
+    n_tokens=15_000_000_000_000,
+    n_gpus=256,
+    gpu_memory_gb=80.0,
+    gpu_tflops=989.0,  # H100 BF16 dense
+    mfu=0.40,
+)
+print(report)
+
+
+# %% [markdown]
+# ---
 # ## Summary
 #
 
@@ -481,16 +536,18 @@ judge.summary()
 # ---
 # ## Key Takeaways
 #
-# 1. **Memory wall:** Training a large model requires 16 bytes per parameter (weights + gradients + Adam states). GPT-3 needs ~2.8 TB — impossible on a single GPU.
-#
-# 2. **Time wall:** Even if memory weren't an issue, training on a single GPU would take years. 1024+ GPUs reduce this to days.
-#
-# 3. **Communication is the bottleneck:** NVLink (within node) is fast; InfiniBand (cross-node) is the real constraint in large clusters.
-#
-# 4. **Four parallelism axes:** Data, Tensor, Pipeline, and Sequence parallelism each solve different aspects of the problem.
+# 1. **Memory wall:** Training a large model requires ~16 bytes per parameter (weights + grads + Adam state).
+#    GPT-3 needs ~2.8 TB — impossible on a single GPU.
+# 2. **Time wall:** Even if memory weren't an issue, single-GPU training would take years; thousands of
+#    GPUs cut it to days.
+# 3. **Communication is the bottleneck:** NVLink (within node) is fast; InfiniBand (cross-node) is the
+#    real constraint at scale.
+# 4. **Multiple parallelism axes:** DP, FSDP, TP, embedding, pipeline, sequence, expert — each solves a
+#    different bottleneck. The rest of the course implements them one by one in JAX + Equinox.
 #
 # ---
-# **Next:** [Chapter 2 — Data Parallelism](./chapter_02_data_parallelism.ipynb)
+# **Next:** [Chapter 2 — Data Parallelism](./chapter_02_data_parallelism.ipynb) — train a tiny GPT on
+# TinyStories across N devices using `Mesh` + `PartitionSpec` + Equinox.
 #
 
 # %%
