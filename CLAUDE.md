@@ -1,0 +1,3 @@
+- Use the Noam Notation(Shape Suffix Notation) with x as the seperator for tensor variables names. (inputs_BLD becomes inputs_BxLxD)
+- B = batch, S = sequence, E = embedding dim, H = heads, D = head dim, V = vocab, Dh = head_dim//2 (RoPE), BS = batch×seq flattened, Sq/Sk = query/key seq when asymmetric
+- Pefer Einsum notation wherever applicable.

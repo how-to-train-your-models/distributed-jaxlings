@@ -23,12 +23,38 @@
 #
 # ## Learning Objectives
 #
-# - Explain the data parallel training loop
+# - Explain the data parallel training loop and why gradient averaging keeps model copies in sync
 # - Describe the Ring-AllReduce algorithm and its bandwidth efficiency
+# - Map Ring-AllReduce to JAX's `jax.lax.pmean` / `jax.pmap` APIs
 # - Distinguish synchronous vs asynchronous gradient updates
 # - Implement gradient accumulation to simulate larger batch sizes
 # - Explain ZeRO stages and the memory savings they provide
 #
+
+# %% [markdown]
+# ---
+# ## Setup
+#
+
+# %%
+import os
+# Simulate 4 CPU devices so pmap examples run on any machine (including single-GPU Colab).
+# Must be set before JAX is imported.
+os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
+
+import functools
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+
+from typing import Any, List, Tuple
+from jaxtyping import Array, Float, Integer
+from judge import Judge
+
+judge = Judge("Chapter 2")
+print(f"JAX devices: {jax.devices()}")
+print("Judge ready!")
 
 # %% [markdown]
 # ---
@@ -38,7 +64,7 @@
 #
 # **Core idea:**
 # 1. Each worker (GPU) holds a **full copy** of the model
-# 2. The global mini-batch is **split** across workers (each sees a different micro-batch)
+# 2. The global mini-batch is **split** across workers — each sees a different micro-batch
 # 3. Each worker computes a forward + backward pass independently
 # 4. Gradients are **averaged** across all workers (AllReduce)
 # 5. Each worker applies the same gradient update → models stay in sync
@@ -46,67 +72,396 @@
 # ```
 # Global batch = [b0, b1, b2, b3]  (4 micro-batches)
 #
-# GPU 0: model_copy | b0 → grad_0 ─┐
-# GPU 1: model_copy | b1 → grad_1 ─┤→ AllReduce → avg_grad → update all
-# GPU 2: model_copy | b2 → grad_2 ─┤
-# GPU 3: model_copy | b3 → grad_3 ─┘
+# GPU 0: model_copy | b0 → dW_0 ─┐
+# GPU 1: model_copy | b1 → dW_1 ─┤→ AllReduce → dW_avg → update all
+# GPU 2: model_copy | b2 → dW_2 ─┤
+# GPU 3: model_copy | b3 → dW_3 ─┘
 # ```
 #
-# **Effective batch size** = micro_batch_size × n_workers. Data parallelism with N GPUs gives a theoretical **N× speedup** — bounded by communication cost.
+# **Effective batch size** = micro_batch_size × n_workers.
 #
-# ### Real-world example
-# PyTorch DDP (`DistributedDataParallel`) uses data parallelism. It overlaps gradient AllReduce with the backward pass, so communication is hidden behind compute:
+# ### The gradient is already a partial sum
+#
+# For a linear layer `Y_BxSxF = X_BxSxD @ W_DxF`, the gradient of the loss w.r.t. `W` is:
+#
+# ```
+# dW_DxF = einsum("b s d, b s f -> d f", X_BxSxD, δ_BxSxF)
+# ```
+#
+# This einsum sums over `b` and `s`, collapsing the entire batch into a single `[D, F]`
+# tensor — **the same shape as W**. Each entry `dW[d, f]` tells you how much to nudge
+# `W[d, f]`. The gradient is already a *partial sum* over the local micro-batch.
+#
+# ### Why AllReduce is necessary
+#
+# Without AllReduce, each worker updates its model copy with its own local gradient:
+#
+# ```
+# ✗ Without AllReduce:
+#   GPU 0: W -= lr * dW_0   ← only saw batch 0
+#   GPU 1: W -= lr * dW_1   ← only saw batch 1
+#   → models diverge after one step — the copies are no longer identical
+# ```
+#
+# We need every worker to agree on a single `dW` before updating.
+# That requires combining N gradient tensors into one — this is a **reduce** operation.
+#
+# **Reduce** means: combine many values into one using some operation.
+# Here the operation is element-wise mean across workers:
+#
+# ```
+# reduce(mean, [dW_0, dW_1, dW_2, dW_3])  →  dW_avg      (one [D,F] tensor)
+#
+# dW_avg[d, f] = mean over workers of dW_w[d, f]     ∀ (d, f)
+# ```
+#
+# The "All" in AllReduce means the result is sent back to **all** workers, not just one.
+#
+# **Important:** AllReduce only produces `dW_avg` — it does not touch the model weights.
+# The weight update is a separate local step that each worker performs independently
+# after AllReduce completes:
+#
+# ```
+# Step 1 — AllReduce (communication):
+#   [dW_0, dW_1, dW_2, dW_3]  →  dW_avg     (every worker now holds this)
+#
+# Step 2 — Weight update (local, no communication):
+#   GPU 0: W -= lr * dW_avg   ┐
+#   GPU 1: W -= lr * dW_avg   ├  each worker updates its own copy identically
+#   GPU 2: W -= lr * dW_avg   ┘
+# ```
+#
+# Because every worker applies the same `dW_avg`, the copies stay in sync after the update.
+# AllReduce is the **only communication step** in data parallelism.
+#
+# **Axis legend:** `B`=batch · `S`=seq · `D`=model dim · `F`=ff dim · `W`=workers · `P`=params · `Ps`=param shard
+#
+
+# %% [markdown]
+# ---
+# ### Exercise 1: Data Parallel Gradient Averaging
+#
+# Each worker computes `dW` over its micro-batch.
+# Implement `worker_grad_W` and `data_parallel_average`.
+#
+
+# %%
+def worker_grad_W(
+    X_BxSxD:     Float[Array, "B S D"],
+    delta_BxSxF: Float[Array, "B S F"],
+) -> Float[Array, "D F"]:
+    """
+    Gradient of a linear layer's weight matrix on one micro-batch.
+
+    dW_DxF = einsum("b s d, b s f -> d f", X_BxSxD, delta_BxSxF)
+
+    Args:
+        X_BxSxD:     activations,        shape [B, S, D]
+        delta_BxSxF: upstream gradient,  shape [B, S, F]
+
+    Returns:
+        dW_DxF of shape [D, F]
+    """
+    raise NotImplementedError(
+        "TODO: return jnp.einsum('bsd,bsf->df', X_BxSxD, delta_BxSxF)"
+    )
+
+
+def data_parallel_average(
+    worker_grads_WxDxF: Float[Array, "W D F"],
+) -> Float[Array, "D F"]:
+    """
+    Average gradients from all workers — simulates the AllReduce result.
+
+    Reduces along the W axis element-wise; D and F are unchanged.
+    Shape: [W, D, F] → [D, F]
+
+    Args:
+        worker_grads_WxDxF: stacked gradients, shape [W, D, F]
+
+    Returns:
+        dW_avg_DxF of shape [D, F]
+    """
+    raise NotImplementedError(
+        "TODO: return jnp.mean(worker_grads_WxDxF, axis=0)\n"
+        "      equivalently: jnp.einsum('wdf->df', worker_grads_WxDxF) / W"
+    )
+
+
+# ── Test ─────────────────────────────────────────────────────────────────────
+key = jax.random.PRNGKey(0)
+B, S, D, F, W = 4, 6, 8, 16, 3
+
+Xs_WxBxSxD     = jax.random.normal(key, (W, B, S, D))
+deltas_WxBxSxF = jax.random.normal(key, (W, B, S, F))
+
+local_grads_WxDxF = jnp.stack([worker_grad_W(Xs_WxBxSxD[w], deltas_WxBxSxF[w]) for w in range(W)])
+avg_grad_DxF      = data_parallel_average(local_grads_WxDxF)
+
+expected_avg_DxF = jnp.mean(
+    jnp.stack([jnp.einsum("bsd,bsf->df", Xs_WxBxSxD[w], deltas_WxBxSxF[w]) for w in range(W)]),
+    axis=0,
+)
+
+judge.check("Ex1a: worker_grad_W shape",         local_grads_WxDxF.shape, (W, D, F))
+judge.check("Ex1b: data_parallel_average shape", avg_grad_DxF.shape,      (D, F))
+judge.check("Ex1c: averaged values correct",     avg_grad_DxF,            expected_avg_DxF)
+
+# %% [markdown]
+# <details>
+# <summary>💡 Hint</summary>
+#
 # ```python
-# model = DDP(model)  # wraps model, hooks AllReduce into .backward()
-# loss.backward()     # computes grads AND synchronizes them
-# optimizer.step()    # all workers apply identical update
+# # worker_grad_W
+# return jnp.einsum("bsd,bsf->df", X_BxSxD, delta_BxSxF)
+#
+# # data_parallel_average
+# return jnp.mean(worker_grads_WxDxF, axis=0)
 # ```
+# </details>
 #
 
 # %% [markdown]
 # ---
 # ## 2. AllReduce: Synchronizing Gradients
 #
-# AllReduce is the collective operation that **reduces tensors across all workers and distributes the result back to all workers**.
+# AllReduce **reduces tensors across all workers and distributes the result back to everyone**.
+# It is the only communication step in data parallelism.
 #
-# ### Naive AllReduce (parameter server)
-# ```
-# All workers → send grad to server → server sums → broadcast back
-# ```
-# - Server bandwidth: O(N × model_size) — bottleneck!
+# ### Three topologies — very different bandwidth costs
 #
-# ### Ring-AllReduce
-# Each GPU is arranged in a ring. The algorithm runs in **two phases**:
+# **Parameter server** (not AllReduce — a different architecture entirely):
+# ```
+# All workers → send dW[P] to a dedicated server node → server sums → broadcasts back
+# Server bandwidth: N × P incoming + N × P outgoing = 2NP   ← bottleneck scales with N
+# ```
+# A central node holds the parameters and acts as an aggregator.
+# **JAX does not support this** — JAX is SPMD: every device runs the same program.
+# There is no concept of a "server" role in JAX.
+#
+# **Naive AllReduce** (star/coordinator topology):
+# ```
+# All workers → send dW[P] to one coordinator worker → coordinator sums → broadcasts back
+# Coordinator bandwidth: N × P in + N × P out = 2NP   ← same bottleneck, different node
+# ```
+#
+# **Ring-AllReduce** — no bottleneck node, bandwidth-optimal:
+#
+# Workers are arranged in a ring. The gradient vector (shape `[P]`) is split into N chunks.
 #
 # **Phase 1 — Reduce-Scatter** (N-1 steps):
-# - Each GPU sends a chunk to its right neighbor and receives a chunk from left
-# - After N-1 steps, each GPU holds the **fully reduced** version of one chunk
+# Each worker sends one chunk rightward and **adds** the received chunk to its own.
+# After N-1 steps, each worker owns the **fully reduced** version of exactly one chunk.
 #
 # **Phase 2 — AllGather** (N-1 steps):
-# - Each GPU sends its complete chunk rightward
-# - After N-1 steps, every GPU has all chunks → full result
-#
-# **Bandwidth efficiency:**
-# - Each GPU sends/receives exactly `2(N-1)/N × S` bytes total
-# - As N → ∞, bandwidth per GPU → **2S** (independent of N!)
-# - Ring-AllReduce is **bandwidth-optimal**
+# Each worker sends its complete (reduced) chunk rightward, **overwriting** the receiver's copy.
+# After N-1 steps, every worker has all chunks → full averaged gradient.
 #
 # ```
-# Ring with 4 GPUs, gradient split into 4 chunks [A, B, C, D]
+# Ring with 4 workers, gradient split into 4 chunks [A, B, C, D]
 #
-# Initial:  GPU0=[A,B,C,D]  GPU1=[A,B,C,D]  GPU2=[A,B,C,D]  GPU3=[A,B,C,D]
-#
-# --- Reduce-Scatter (3 steps) ---
-# Step 1:   GPU0 sends A→GPU1, GPU1 sends B→GPU2, GPU2 sends C→GPU3, GPU3 sends D→GPU0
-# Step 2:   GPU0 sends D+A→GPU1, GPU1 sends A+B→GPU2, ...
-# Step 3:   Each GPU owns one fully-reduced chunk
-#
-# --- AllGather (3 steps) ---
-# Each GPU distributes its chunk around the ring
-#
-# Final:    All GPUs have [A+A+A+A, B+B+B+B, C+C+C+C, D+D+D+D] / 4
+# Initial:          W0=[A,B,C,D]  W1=[A,B,C,D]  W2=[A,B,C,D]  W3=[A,B,C,D]
+# After Reduce-Scatter:  W0 owns ΣA    W1 owns ΣB    W2 owns ΣC    W3 owns ΣD
+# After AllGather:       all workers hold [ΣA, ΣB, ΣC, ΣD]
 # ```
 #
+# **Bandwidth per worker:** `2(N-1)/N × P` → converges to **2P** as N → ∞.
+# Each worker always sends/receives ≈ 2P regardless of how many workers there are.
+#
+# **Memory:** each worker holds exactly one `P`-sized buffer throughout.
+# Chunks are overwritten in-place — memory per worker stays `O(P)`.
+#
+
+# %% [markdown]
+# ---
+# ### Exercise 2: Ring-AllReduce
+#
+# Implement the two-phase Ring-AllReduce over a list of 1-D JAX arrays (one per worker).
+#
+
+# %%
+def ring_allreduce(
+    worker_data: List[Float[Array, "P"]],
+) -> List[Float[Array, "P"]]:
+    """
+    Ring-AllReduce over a list of 1-D JAX arrays (one per worker).
+
+    Args:
+        worker_data: list of n arrays, each shape [P]  (P must be divisible by n)
+
+    Returns:
+        list of n arrays — each worker holds the element-wise SUM.
+        (divide by n externally to get the mean)
+    """
+    n = len(worker_data)
+    p = worker_data[0].shape[0]
+    assert p % n == 0, "P must be divisible by n for this simplified version"
+    chunk = p // n
+
+    # chunks[w][i] = slice i of worker w's gradient vector
+    chunks = [
+        [worker_data[w][i * chunk:(i + 1) * chunk] for i in range(n)]
+        for w in range(n)
+    ]
+
+    # ── Phase 1: Reduce-Scatter ──────────────────────────────────────────────
+    # Goal: worker w ends up with the fully-reduced version of chunk w.
+    # Each step: every worker receives one chunk from its left neighbour and adds it.
+    for step in range(n - 1):
+        new_chunks = [row[:] for row in chunks]
+        for w in range(n):
+            src = (w - 1) % n              # left neighbour
+            idx = 0                        # TODO: (w - 1 - step) % n
+            raise NotImplementedError(
+                "TODO: idx = (w - 1 - step) % n\n"
+                "      new_chunks[w][idx] = chunks[w][idx] + chunks[src][idx]"
+            )
+        chunks = new_chunks
+
+    # ── Phase 2: AllGather ───────────────────────────────────────────────────
+    # Goal: every worker has all fully-reduced chunks.
+    # Each step: every worker receives a complete chunk from its left neighbour and overwrites.
+    for step in range(n - 1):
+        new_chunks = [row[:] for row in chunks]
+        for w in range(n):
+            src = (w - 1) % n
+            idx = 0                        # TODO: (w - step) % n
+            raise NotImplementedError(
+                "TODO: idx = (w - step) % n\n"
+                "      new_chunks[w][idx] = chunks[src][idx]"
+            )
+        chunks = new_chunks
+
+    return [jnp.concatenate(chunks[w]) for w in range(n)]
+
+
+# ── Test ─────────────────────────────────────────────────────────────────────
+key = jax.random.PRNGKey(1)
+W, P = 4, 8
+data = [jax.random.normal(key, (P,)) for _ in range(W)]
+
+true_sum_P = jnp.sum(jnp.stack(data), axis=0)
+results    = ring_allreduce(data)
+
+judge.check("Ex2a: worker 0 holds the sum",
+            results[0], true_sum_P)
+judge.check("Ex2b: all workers agree",
+            jnp.allclose(results[0], results[1]) and jnp.allclose(results[1], results[3]),
+            True)
+
+# %% [markdown]
+# <details>
+# <summary>💡 Hint — Reduce-Scatter</summary>
+#
+# ```python
+# for step in range(n - 1):
+#     new_chunks = [row[:] for row in chunks]
+#     for w in range(n):
+#         src = (w - 1) % n
+#         idx = (w - 1 - step) % n
+#         new_chunks[w][idx] = chunks[w][idx] + chunks[src][idx]
+#     chunks = new_chunks
+# ```
+# </details>
+#
+# <details>
+# <summary>💡 Hint — AllGather</summary>
+#
+# ```python
+# for step in range(n - 1):
+#     new_chunks = [row[:] for row in chunks]
+#     for w in range(n):
+#         src = (w - 1) % n
+#         idx = (w - step) % n
+#         new_chunks[w][idx] = chunks[src][idx]
+#     chunks = new_chunks
+# ```
+# </details>
+#
+
+# %% [markdown]
+# ---
+# ## 2b. JAX in Practice: `pmap` + `lax.pmean`
+#
+# You just implemented Ring-AllReduce by hand. In JAX you never write this —
+# XLA compiles it for you. The full data-parallel training loop is:
+#
+# ```python
+# @functools.partial(jax.pmap, axis_name="devices")
+# def train_step(W_DxF, X_BxSxD, Y_BxSxF):
+#     grads_DxF = jax.grad(loss_fn)(W_DxF, X_BxSxD, Y_BxSxF)
+#     grads_DxF = jax.lax.pmean(grads_DxF, axis_name="devices")  # ← Ring-AllReduce here
+#     updates, new_opt_state = optimizer.update(grads_DxF, opt_state)
+#     return optax.apply_updates(W_DxF, updates)
+# ```
+#
+# `jax.pmap` maps a function across devices (the implicit `W` axis).
+# `jax.lax.pmean` averages the tensor element-wise across all devices in `axis_name`:
+#
+# ```
+# Each device holds:  grads_DxF   shape [D, F]
+# After pmean:        grads_DxF   shape [D, F]   (same shape — now averaged across W devices)
+# ```
+#
+# The `W` axis is implicit inside `pmap` — `pmean` collapses it without you ever
+# stacking tensors manually. XLA emits Ring-AllReduce automatically.
+#
+# ### JAX collective API
+#
+# | Operation | JAX API | Shape inside pmap |
+# |---|---|---|
+# | AllReduce mean | `jax.lax.pmean(x, axis_name)` | `[D, F] → [D, F]` (averaged) |
+# | AllReduce sum  | `jax.lax.psum(x, axis_name)`  | `[D, F] → [D, F]` (summed) |
+# | Reduce-Scatter | `jax.lax.reduce_scatter(x, axis_name, scatter_dimension=0)` | `[D, F] → [D//W, F]` |
+# | AllGather      | `jax.lax.all_gather(x, axis_name)` | `[D, F] → [W, D, F]` |
+# | Parallel map   | `jax.pmap(fn, axis_name)` | maps fn over leading device axis |
+#
+
+# %%
+# ── Demo: pmap + lax.pmean (read-only, no exercise) ──────────────────────────
+
+def mse_loss(
+    W_DxF:   Float[Array, "D F"],
+    X_BxSxD: Float[Array, "B S D"],
+    Y_BxSxF: Float[Array, "B S F"],
+) -> Float[Array, ""]:
+    """MSE loss for a linear layer. Axes: B=batch, S=seq, D=in_dim, F=out_dim."""
+    Y_hat_BxSxF = jnp.einsum("bsd,df->bsf", X_BxSxD, W_DxF)
+    return jnp.mean((Y_hat_BxSxF - Y_BxSxF) ** 2)
+
+
+n_devices = len(jax.devices())
+key = jax.random.PRNGKey(42)
+B_demo, S_demo, D_demo, F_demo = 2, 4, 6, 8
+
+W_true_DxF      = jax.random.normal(key, (D_demo, F_demo))
+X_ndevxBxSxD    = jax.random.normal(key, (n_devices, B_demo, S_demo, D_demo))
+Y_ndevxBxSxF    = jnp.stack([
+    jnp.einsum("bsd,df->bsf", X_ndevxBxSxD[i], W_true_DxF) for i in range(n_devices)
+])
+
+W_init_DxF           = jax.random.normal(jax.random.PRNGKey(99), (D_demo, F_demo)) * 0.01
+W_replicated_ndevxDxF = jax.device_put_replicated(W_init_DxF, jax.devices())
+
+
+@functools.partial(jax.pmap, axis_name="devices")
+def pmap_grad_step(
+    W_DxF:   Float[Array, "D F"],
+    X_BxSxD: Float[Array, "B S D"],
+    Y_BxSxF: Float[Array, "B S F"],
+) -> Float[Array, "D F"]:
+    """Compute gradient on each device's micro-batch, then AllReduce via pmean."""
+    grads_DxF = jax.grad(mse_loss)(W_DxF, X_BxSxD, Y_BxSxF)
+    return jax.lax.pmean(grads_DxF, axis_name="devices")   # Ring-AllReduce
+
+
+avg_grads_ndevxDxF = pmap_grad_step(W_replicated_ndevxDxF, X_ndevxBxSxD, Y_ndevxBxSxF)
+
+print(f"Devices: {n_devices}")
+print(f"All devices agree on averaged gradient: "
+      f"{jnp.allclose(avg_grads_ndevxDxF[0], avg_grads_ndevxDxF[-1])}")
+print(f"Gradient shape per device: {avg_grads_ndevxDxF[0].shape}  "
+      f"(D={D_demo}, F={F_demo}) — same as W, not [W,D,F]")
 
 # %% [markdown]
 # ---
@@ -117,534 +472,347 @@
 # | **Gradient update** | All workers sync before step | Workers update independently |
 # | **Convergence** | Identical to single-GPU math | Stale gradients → noise |
 # | **Stragglers** | Slowest worker blocks all | No blocking |
-# | **Used by** | PyTorch DDP, JAX pmap | Hogwild!, some RL systems |
+# | **Used by** | JAX `pmap`, PyTorch DDP | Hogwild!, some RL systems |
 #
-# Modern LLM training is **always synchronous** — stale gradients hurt convergence too much at scale.
+# **What "stale" means:** a stale gradient was computed at model weights from a previous step.
+# You descend the loss landscape using a slope measured at a different point —
+# the further your current weights are from where the gradient was measured,
+# the more likely you are to step in the wrong direction.
+#
+# ### Illustration: fresh vs stale gradient on a 1D quadratic
+#
+
+# %%
+# ── Staleness illustration (read-only) ───────────────────────────────────────
+# Loss: L(w) = (w - w*)²,  true gradient: dL/dw = 2(w - w*)
+w_star = 3.0
+lr_demo = 0.3
+
+def grad_quadratic(w: float) -> float:
+    return 2.0 * (w - w_star)
+
+w_sync  = 0.0
+w_async = 0.0
+
+for step in range(8):
+    # Synchronous: gradient at current w
+    w_sync -= lr_demo * grad_quadratic(w_sync)
+
+    # Asynchronous: gradient was computed 2 steps ago
+    w_stale_ref = w_async - 2 * lr_demo * grad_quadratic(w_async)
+    w_async    -= lr_demo * grad_quadratic(w_stale_ref)
+
+print(f"After 8 steps:")
+print(f"  Sync  → w = {w_sync:.4f}  (distance to w*={w_star}: {abs(w_sync - w_star):.4f})")
+print(f"  Async → w = {w_async:.4f}  (distance to w*={w_star}: {abs(w_async - w_star):.4f})")
+print(f"  Sync converges tighter: {abs(w_sync - w_star) < abs(w_async - w_star)}")
+
+# %% [markdown]
+# Modern LLM training is **always synchronous** — stale gradients hurt convergence too much
+# at scale, and the compute-to-communication ratio is large enough that waiting for the
+# slowest worker costs relatively little.
 #
 
 # %% [markdown]
 # ---
 # ## 4. Gradient Accumulation
 #
-# When GPU memory limits the batch size, you can **accumulate gradients** over multiple forward/backward passes before updating:
+# When GPU memory limits the per-step batch size, accumulate gradients over several
+# micro-batches before updating:
+#
+# ```
+# effective_batch = micro_batch × accumulation_steps × n_workers
+# ```
+#
+# In JAX functional style this means summing `jax.value_and_grad` outputs before
+# passing them to `optax`:
 #
 # ```python
-# effective_batch = micro_batch * accumulation_steps * n_gpus
-#
-# for step, batch in enumerate(dataloader):
-#     loss = model(batch) / accumulation_steps
-#     loss.backward()                          # accumulates in .grad
-#     if (step + 1) % accumulation_steps == 0:
-#         optimizer.step()                     # update once
-#         optimizer.zero_grad()
+# grads_acc_DxF = jnp.zeros_like(W_DxF)
+# step_loss = 0.0
+# for X_mb_BxSxD, Y_mb_BxSxF in zip(micro_Xs, micro_Ys):
+#     loss, g_DxF   = jax.value_and_grad(mse_loss)(W_DxF, X_mb_BxSxD, Y_mb_BxSxF)
+#     step_loss     += loss
+#     grads_acc_DxF  = grads_acc_DxF + g_DxF
+# avg_grad_DxF = grads_acc_DxF / n_acc
+# updates, new_opt_state = optimizer.update(avg_grad_DxF, opt_state)
+# W_DxF = optax.apply_updates(W_DxF, updates)
 # ```
 #
-# With gradient accumulation, you can train with an **effective batch size** that doesn't fit in memory.
+# Summing `dW` over micro-batches and dividing by `n_acc` is mathematically identical
+# to computing the gradient on the full effective batch in a single forward+backward pass.
 #
 
 # %% [markdown]
 # ---
-# ## 5. ZeRO: Zero Redundancy Optimizer
+# ### Exercise 3: Gradient Accumulation in JAX
 #
-# Data parallelism stores a **full model copy on every GPU** — wasteful! ZeRO (Rajbhandari et al., 2020) eliminates this redundancy progressively:
-#
-# ```
-#               Memory per GPU (175B model, 64 GPUs)
-# Base DDP  ──────────────────────────────────────── 2800 GB  (all on every GPU!)
-# ZeRO-1    Shard optimizer states          ──────── 730 GB   (4× reduction)
-# ZeRO-2    Shard optimizer states+gradients ──────  365 GB   (8× reduction)
-# ZeRO-3    Shard everything (weights too)  ───────   43 GB   (64× = N GPUs)
-# ```
-#
-# **ZeRO-1:** Each rank owns 1/N of the optimizer states. After AllReduce of gradients, each rank updates its shard, then AllGather parameters.
-#
-# **ZeRO-2:** Additionally shard gradients. After Reduce-Scatter, each rank owns only the gradient shard it needs.
-#
-# **ZeRO-3:** Shard weights too. Parameters are gathered on-demand during forward/backward pass.
-#
-# **Trade-off:** Communication volume increases (need extra AllGather for parameters), but memory savings often outweigh this.
-#
-
-# %% [markdown]
-# ---
-# ## Judge Setup
+# Train a linear model `Y_BxSxF = X_BxSxD @ W_DxF` with gradient accumulation.
+# Use `jax.value_and_grad` for differentiation and `optax.adam` for the optimizer.
 #
 
 # %%
-import numpy as np
-
-class Judge:
-    def __init__(self):
-        self.passed = 0
-        self.failed = 0
-
-    def check(self, name, got, expected, tol=1e-5):
-        if isinstance(expected, np.ndarray):
-            ok = np.allclose(got, expected, atol=tol)
-        elif isinstance(expected, (int, float)):
-            ok = abs(got - expected) / (abs(expected) + 1e-9) < tol
-        else:
-            ok = got == expected
-        if ok:
-            self.passed += 1
-            print(f"✅ {name}: PASSED")
-        else:
-            self.failed += 1
-            print(f"❌ {name}: FAILED")
-            print(f"   got:      {got}")
-            print(f"   expected: {expected}")
-        return ok
-
-    def summary(self):
-        total = self.passed + self.failed
-        print(f"\n{'='*40}")
-        print(f"  Results: {self.passed}/{total} passed")
-        if self.failed == 0:
-            print("  🎉 Chapter 2 complete!")
-        else:
-            print(f"  {self.failed} exercise(s) remaining.")
-        print('='*40)
-
-judge = Judge()
-print("Judge ready!")
-
-# %% [markdown]
-# ---
-# ## Exercise 1: Data Parallel Gradient Averaging
-#
-# Simulate data parallelism. Each 'worker' independently computes gradients on its micro-batch. Implement the function that **averages gradients across all workers**.
-#
-# In real systems this is done by AllReduce. Here we simulate it in Python.
-#
-# ```
-# TODO: Implement data_parallel_average
-# ```
-#
-
-# %%
-import numpy as np
-
-def simulate_worker_gradients(n_workers: int, n_params: int, seed: int = 42) -> list:
-    """Simulate each worker computing gradients on its micro-batch."""
-    rng = np.random.default_rng(seed)
-    return [rng.standard_normal(n_params) for _ in range(n_workers)]
-
-
-def data_parallel_average(worker_grads: list) -> np.ndarray:
+def accumulate_and_step(
+    W_DxF:     Float[Array, "D F"],
+    opt_state: Any,
+    optimizer: Any,
+    micro_Xs:  List[Float[Array, "B S D"]],
+    micro_Ys:  List[Float[Array, "B S F"]],
+) -> Tuple[Float[Array, "D F"], Any, Float[Array, ""]]:
     """
-    Given a list of gradient arrays (one per worker), return the
-    element-wise average — the gradient every worker should apply.
-    
+    Accumulate gradients over micro-batches, then apply one optimizer step.
+
     Args:
-        worker_grads: List of np.ndarray, each shape (n_params,)
-    
+        W_DxF:     weight matrix [D, F]
+        opt_state: current optax optimizer state
+        optimizer: optax optimizer (e.g. optax.adam(...))
+        micro_Xs:  list of micro-batch inputs,  each [B, S, D]
+        micro_Ys:  list of micro-batch targets, each [B, S, F]
+
     Returns:
-        np.ndarray of shape (n_params,) — the averaged gradient
+        (new_W_DxF, new_opt_state, avg_step_loss)
     """
-    # TODO: Stack all worker gradients and compute the mean across workers
-    pass
+    raise NotImplementedError(
+        "TODO:\n"
+        "  n_acc = len(micro_Xs)\n"
+        "  grads_acc_DxF = jnp.zeros_like(W_DxF)\n"
+        "  step_loss = 0.0\n"
+        "  for X_mb_BxSxD, Y_mb_BxSxF in zip(micro_Xs, micro_Ys):\n"
+        "      loss, g_DxF = jax.value_and_grad(mse_loss)(W_DxF, X_mb_BxSxD, Y_mb_BxSxF)\n"
+        "      step_loss += loss\n"
+        "      grads_acc_DxF = grads_acc_DxF + g_DxF\n"
+        "  avg_grad_DxF = grads_acc_DxF / n_acc\n"
+        "  updates, new_opt_state = optimizer.update(avg_grad_DxF, opt_state)\n"
+        "  new_W_DxF = optax.apply_updates(W_DxF, updates)\n"
+        "  return new_W_DxF, new_opt_state, step_loss / n_acc"
+    )
 
 
-# Test
-grads = simulate_worker_gradients(n_workers=4, n_params=10)
-avg = data_parallel_average(grads)
+# ── Test ─────────────────────────────────────────────────────────────────────
+key = jax.random.PRNGKey(2)
+B, S, D, F = 8, 4, 6, 3
 
-expected = np.mean(np.stack(grads), axis=0)
-print(f"Averaged gradient shape: {avg.shape}")
-print(f"First 3 values: {avg[:3]}")
-judge.check("Ex1: Data parallel gradient average", avg, expected)
+W_true_DxF = jax.random.normal(key, (D, F))
+W_init_DxF = jax.random.normal(jax.random.PRNGKey(99), (D, F)) * 0.01
 
+optimizer = optax.adam(1e-2)
+opt_state = optimizer.init(W_init_DxF)
+W_cur_DxF = W_init_DxF
+
+n_steps, n_acc = 300, 4
+losses = []
+for _ in range(n_steps):
+    Xs = [jax.random.normal(key, (B, S, D)) for _ in range(n_acc)]
+    Ys = [jnp.einsum("bsd,df->bsf", X, W_true_DxF) for X in Xs]
+    W_cur_DxF, opt_state, l = accumulate_and_step(W_cur_DxF, opt_state, optimizer, Xs, Ys)
+    losses.append(float(l))
+
+judge.check("Ex3a: loss decreased",    losses[-1] < losses[0],                          True)
+judge.check("Ex3b: weights converged", jnp.allclose(W_cur_DxF, W_true_DxF, atol=0.05), True)
 
 # %% [markdown]
 # <details>
 # <summary>💡 Hint</summary>
 #
 # ```python
-# stacked = np.stack(worker_grads)   # shape: (n_workers, n_params)
-# return np.mean(stacked, axis=0)    # shape: (n_params,)
+# n_acc = len(micro_Xs)
+# grads_acc_DxF = jnp.zeros_like(W_DxF)
+# step_loss = 0.0
+# for X_mb_BxSxD, Y_mb_BxSxF in zip(micro_Xs, micro_Ys):
+#     loss, g_DxF = jax.value_and_grad(mse_loss)(W_DxF, X_mb_BxSxD, Y_mb_BxSxF)
+#     step_loss += loss
+#     grads_acc_DxF = grads_acc_DxF + g_DxF
+# avg_grad_DxF = grads_acc_DxF / n_acc
+# updates, new_opt_state = optimizer.update(avg_grad_DxF, opt_state)
+# new_W_DxF = optax.apply_updates(W_DxF, updates)
+# return new_W_DxF, new_opt_state, step_loss / n_acc
 # ```
 # </details>
 #
 
 # %% [markdown]
 # ---
-# ## Exercise 2: Ring-AllReduce
+# ## 5. ZeRO: Zero Redundancy Optimizer
 #
-# Implement a simplified Ring-AllReduce in two phases.
-#
-# **Setup:** N workers, each holding a full gradient vector. Split into N equal chunks.
-#
-# **Phase 1 — Reduce-Scatter:** For N-1 steps, each worker sends chunk `(rank - step) % N` to its right neighbor and **adds** (accumulates) the received chunk.
-#
-# **Phase 2 — AllGather:** For N-1 steps, each worker sends chunk `(rank - step + 1) % N` to its right neighbor, **overwriting** (not adding) the received chunk.
+# Data parallelism stores a **full model copy on every GPU** — wasteful!
+# ZeRO (Rajbhandari et al., 2020) eliminates this redundancy progressively:
 #
 # ```
-# TODO: Implement ring_allreduce
+#               Memory per GPU (175B model, 64 GPUs)
+# Base DDP  ──────────────────────────────────────── 2800 GB  (full copy on every GPU)
+# ZeRO-1    Shard optimizer states          ──────── 730 GB   (4× reduction)
+# ZeRO-2    Shard optimizer states+gradients ──────  365 GB   (8× reduction)
+# ZeRO-3    Shard everything (weights too)  ───────   43 GB   (64× = N GPUs)
 # ```
 #
-
-# %%
-def ring_allreduce(worker_data: list) -> list:
-    """
-    Perform Ring-AllReduce across workers.
-    
-    Args:
-        worker_data: list of np.ndarray (one per worker), each shape (n,)
-                     Values represent local gradients before reduction.
-    
-    Returns:
-        list of np.ndarray — each worker now holds the element-wise SUM
-        (not average) of all inputs. Shape unchanged.
-    
-    Note: We return the SUM here (not average). The caller divides by N.
-    """
-    n = len(worker_data)
-    size = len(worker_data[0])
-    assert size % n == 0, "For simplicity, size must be divisible by n_workers"
-    chunk_size = size // n
-
-    # Split each worker's data into n chunks
-    # chunks[rank][chunk_idx] = np.ndarray of shape (chunk_size,)
-    chunks = [
-        [worker_data[rank][i*chunk_size:(i+1)*chunk_size].copy() for i in range(n)]
-        for rank in range(n)
-    ]
-
-    # ── Phase 1: Reduce-Scatter ──────────────────────────────────────────
-    # For step in range(n-1):
-    #   Each rank sends chunk index `(rank - step) % n` to rank `(rank + 1) % n`
-    #   Receiving rank ADDS the received chunk to its own copy of that chunk
-    for step in range(n - 1):
-        new_chunks = [row[:] for row in chunks]  # shallow copy of lists
-        for rank in range(n):
-            # TODO: compute which chunk this rank sends in this step
-            send_idx = 0      # TODO: (rank - step) % n
-            recv_from = 0     # TODO: (rank - 1) % n  (left neighbor sends to us)
-            recv_idx = 0      # TODO: (rank - 1 - step) % n
-            
-            # TODO: accumulate received chunk into our copy
-            # new_chunks[rank][recv_idx] += chunks[recv_from][recv_idx]
-            pass
-        chunks = new_chunks
-
-    # After reduce-scatter: chunks[rank][rank] holds the fully reduced chunk
-
-    # ── Phase 2: AllGather ───────────────────────────────────────────────
-    # For step in range(n-1):
-    #   Each rank sends chunk index `(rank - step + 1) % n` to rank `(rank + 1) % n`
-    #   Receiving rank OVERWRITES its copy of that chunk
-    for step in range(n - 1):
-        new_chunks = [row[:] for row in chunks]
-        for rank in range(n):
-            # TODO: compute send/receive indices
-            recv_from = 0   # TODO: (rank - 1) % n
-            recv_idx = 0    # TODO: (rank - step) % n  (note: +1-1 simplifies)
-            
-            # TODO: overwrite received chunk
-            # new_chunks[rank][recv_idx] = chunks[recv_from][recv_idx].copy()
-            pass
-        chunks = new_chunks
-
-    # Reassemble each worker's full array
-    result = [np.concatenate(chunks[rank]) for rank in range(n)]
-    return result
-
-
-# Test: all workers should end up with the same summed gradient
-np.random.seed(0)
-data = [np.random.randn(8).astype(np.float64) for _ in range(4)]
-true_sum = np.sum(data, axis=0)
-
-results = ring_allreduce(data)
-print(f"True sum:        {true_sum.round(3)}")
-print(f"Worker 0 result: {results[0].round(3)}")
-print(f"Worker 2 result: {results[2].round(3)}")
-
-judge.check("Ex2a: Ring-AllReduce worker 0 equals sum", results[0], true_sum)
-judge.check("Ex2b: All workers agree",
-            np.allclose(results[0], results[1]) and np.allclose(results[1], results[3]),
-            True)
-
-# %% [markdown]
-# <details>
-# <summary>💡 Hint — Phase 1 (Reduce-Scatter)</summary>
+# **ZeRO-1:** Each rank owns 1/N of the optimizer states (e.g. Adam `m`, `v` moments).
+# After a normal AllReduce of the full gradient, each rank updates **only its shard** of params,
+# then AllGathers the updated shards so all ranks have the complete updated model.
 #
-# ```python
-# for step in range(n - 1):
-#     new_chunks = [row[:] for row in chunks]
-#     for rank in range(n):
-#         recv_from = (rank - 1) % n
-#         recv_idx  = (rank - 1 - step) % n
-#         new_chunks[rank][recv_idx] = (
-#             chunks[rank][recv_idx] + chunks[recv_from][recv_idx]
-#         )
-#     chunks = new_chunks
+# **ZeRO-2:** Additionally shard the gradients. After Reduce-Scatter, each rank receives
+# only the gradient shard it needs — no rank ever holds the full `[P]` gradient.
+#
+# **ZeRO-3:** Shard the weights too. No rank holds a full copy of W at rest.
+# Before each layer's forward pass, ranks AllGather that layer's weights, compute,
+# then **discard** them immediately. Memory is `O(P/N)` but AllGather runs at every
+# layer in both forward and backward — significantly more communication than ZeRO-1/2.
+#
+# **Trade-off:** extra AllGather communication, but memory savings dominate at scale.
+#
+# ### ZeRO-1 data flow in Noam notation
+#
 # ```
-# </details>
+# After standard AllReduce:     dW_P     shape [P]   — every rank has the full gradient
 #
-# <details>
-# <summary>💡 Hint — Phase 2 (AllGather)</summary>
+# Rank r updates its shard:
+#   g_Ps     = dW_P[shard_idx_Ps]        slice this rank's portion of dW
+#   m_Ps, v_Ps updated locally           only 1/N of Adam state lives here
+#   W_P.at[shard_idx_Ps] -= adam_step    only this rank's slice of W changes
 #
-# ```python
-# for step in range(n - 1):
-#     new_chunks = [row[:] for row in chunks]
-#     for rank in range(n):
-#         recv_from = (rank - 1) % n
-#         recv_idx  = (rank - step) % n
-#         new_chunks[rank][recv_idx] = chunks[recv_from][recv_idx].copy()
-#     chunks = new_chunks
+# AllGather — reassemble full params:
+#   [shard_0_Ps | shard_1_Ps | ... | shard_N_Ps]  →  W_P   shape [P]
+#   jnp.concatenate(all updated shards) gives every rank the complete updated W
 # ```
-# </details>
 #
 
 # %% [markdown]
 # ---
-# ## Exercise 3: Gradient Accumulation
+# ### Exercise 4: ZeRO-1 — Local Adam Update + AllGather
 #
-# Implement a training loop with gradient accumulation. Gradients from multiple micro-batches should be accumulated before performing an optimizer step.
-#
-# We use a simple linear regression model to keep it self-contained.
-#
-# ```
-# TODO: Implement the gradient accumulation loop
-# ```
+# Implement the local Adam shard update and the AllGather reconstruction.
+# Together these two functions complete one ZeRO-1 optimizer step.
 #
 
 # %%
-import numpy as np
-
-class SimpleLinear:
-    """Minimal linear regression: y = X @ w"""
-    def __init__(self, in_features, seed=0):
-        rng = np.random.default_rng(seed)
-        self.w = rng.standard_normal(in_features) * 0.01
-        self.grad = np.zeros_like(self.w)
-
-    def forward(self, X):
-        return X @ self.w
-
-    def backward(self, X, residuals):
-        """Accumulate gradients. residuals = (y_pred - y_true)."""
-        self.grad += (2 / len(X)) * X.T @ residuals
-
-    def step(self, lr):
-        self.w -= lr * self.grad
-
-    def zero_grad(self):
-        self.grad = np.zeros_like(self.w)
-
-
-def train_with_accumulation(
-    model: SimpleLinear,
-    X: np.ndarray,
-    y: np.ndarray,
-    n_steps: int,
-    accumulation_steps: int,
-    micro_batch_size: int,
-    lr: float = 0.01
-) -> list:
+def zero1_adam_step_shard(
+    params_P:     Float[Array, "P"],
+    grads_P:      Float[Array, "P"],
+    m_Ps:         Float[Array, "Ps"],
+    v_Ps:         Float[Array, "Ps"],
+    shard_idx_Ps: Integer[Array, "Ps"],
+    lr:           float,
+    beta1:        float = 0.9,
+    beta2:        float = 0.999,
+    eps:          float = 1e-8,
+    t:            int   = 1,
+) -> Tuple[Float[Array, "P"], Float[Array, "Ps"], Float[Array, "Ps"]]:
     """
-    Train using gradient accumulation.
-    
-    Each optimizer step should see gradients accumulated over
-    `accumulation_steps` micro-batches of size `micro_batch_size`.
-    
-    IMPORTANT: Scale the loss by 1/accumulation_steps before backprop
-    so the effective gradient magnitude matches a single large batch.
-    
+    Apply one Adam step to the parameter shard this rank owns.
+    Only positions shard_idx_Ps of params_P are updated; the rest are unchanged.
+
     Args:
-        model:              SimpleLinear instance
-        X, y:               Full dataset
-        n_steps:            Total number of optimizer steps
-        accumulation_steps: Number of micro-batches per optimizer step
-        micro_batch_size:   Samples per micro-batch
-        lr:                 Learning rate
-    
+        params_P:     full parameter vector,          shape [P]
+        grads_P:      full gradient vector,           shape [P]  (from AllReduce)
+        m_Ps:         first moment for this shard,    shape [Ps]
+        v_Ps:         second moment for this shard,   shape [Ps]
+        shard_idx_Ps: global indices owned by rank,   shape [Ps]
+        lr:           learning rate
+        t:            current step (for bias correction)
+
     Returns:
-        List of loss values (one per optimizer step)
+        (updated_params_P [P], new_m_Ps [Ps], new_v_Ps [Ps])
     """
-    losses = []
-    n = len(X)
-    rng = np.random.default_rng(99)
-
-    for step in range(n_steps):
-        # TODO: zero gradients at the start of each optimizer step
-        # model.zero_grad()
-        
-        step_loss = 0.0
-        
-        for acc_step in range(accumulation_steps):
-            # Sample a random micro-batch
-            idx = rng.integers(0, n, micro_batch_size)
-            Xb, yb = X[idx], y[idx]
-            
-            # TODO: forward pass
-            y_pred = None  # TODO: model.forward(Xb)
-            
-            # TODO: compute MSE loss (scaled by 1/accumulation_steps)
-            residuals = None  # TODO: y_pred - yb
-            loss = 0.0        # TODO: np.mean(residuals**2) / accumulation_steps
-            step_loss += loss
-            
-            # TODO: backward pass (note: model.backward accumulates into .grad)
-            # The residuals passed to backward should also be scaled by 1/accumulation_steps
-            # model.backward(Xb, residuals / accumulation_steps)
-        
-        # TODO: optimizer step
-        # model.step(lr)
-        
-        losses.append(step_loss)
-    
-    return losses
+    raise NotImplementedError(
+        "TODO:\n"
+        "  g_Ps     = grads_P[shard_idx_Ps]\n"
+        "  new_m_Ps = beta1 * m_Ps + (1 - beta1) * g_Ps\n"
+        "  new_v_Ps = beta2 * v_Ps + (1 - beta2) * g_Ps ** 2\n"
+        "  m_hat_Ps = new_m_Ps / (1 - beta1 ** t)\n"
+        "  v_hat_Ps = new_v_Ps / (1 - beta2 ** t)\n"
+        "  params_P = params_P.at[shard_idx_Ps].add(\n"
+        "      -lr * m_hat_Ps / (jnp.sqrt(v_hat_Ps) + eps)\n"
+        "  )\n"
+        "  return params_P, new_m_Ps, new_v_Ps"
+    )
 
 
-# Generate synthetic data: y = 2*x1 + 3*x2 + noise
-rng = np.random.default_rng(42)
-X = rng.standard_normal((1000, 2))
-y = X @ np.array([2.0, 3.0]) + 0.1 * rng.standard_normal(1000)
-
-model = SimpleLinear(in_features=2)
-losses = train_with_accumulation(model, X, y, n_steps=200, accumulation_steps=4,
-                                  micro_batch_size=32, lr=0.05)
-
-print(f"Initial loss: {losses[0]:.4f}")
-print(f"Final loss:   {losses[-1]:.4f}")
-print(f"Learned weights: {model.w} (target: [2.0, 3.0])")
-
-judge.check("Ex3a: Loss decreased", losses[-1] < losses[0], True)
-judge.check("Ex3b: Weights converged to [2, 3]",
-            np.allclose(model.w, [2.0, 3.0], atol=0.1), True)
-
-# %% [markdown]
-# ---
-# ## Exercise 4: ZeRO-1 Optimizer State Sharding
-#
-# In ZeRO-1, each rank is responsible for updating **only its shard** of the parameters. After the update, parameters are gathered (AllGather) so all ranks have the full updated model.
-#
-# Implement the function that assigns parameter indices to ranks:
-#
-# ```
-# TODO: Implement zero1_assign_shards and zero1_update_shard
-# ```
-#
-
-# %%
-import numpy as np
-from typing import List, Tuple
-
-
-def zero1_assign_shards(n_params: int, n_ranks: int) -> List[np.ndarray]:
+def zero1_allgather(
+    rank_shards:   List[Float[Array, "Ps"]],
+    shard_indices: List[Integer[Array, "Ps"]],
+    n_params:      int,
+) -> Float[Array, "P"]:
     """
-    Assign parameter indices to ranks for ZeRO-1 sharding.
-    Distribute parameters as evenly as possible (round-robin or contiguous).
-    
+    Reconstruct full params from per-rank updated shards (simulates AllGather).
+
+    After each rank calls zero1_adam_step_shard, it holds updated values only for
+    its own shard. This function assembles all shards back into the full [P] vector,
+    giving every rank the complete updated model.
+
     Args:
-        n_params: Total number of parameters
-        n_ranks:  Number of workers/GPUs
-    
+        rank_shards:   list of n arrays — updated param values per rank,  each [Ps]
+        shard_indices: list of n arrays — global param indices per rank,  each [Ps]
+        n_params:      total number of parameters P
+
     Returns:
-        List of length n_ranks, each element is a np.ndarray of parameter
-        indices assigned to that rank.
+        params_P of shape [P]
     """
-    # TODO: Assign indices 0..n_params-1 to ranks as evenly as possible
-    # Hint: np.array_split(np.arange(n_params), n_ranks)
-    pass
+    raise NotImplementedError(
+        "TODO:\n"
+        "  params_P = jnp.zeros(n_params)\n"
+        "  for shard_vals_Ps, idx_Ps in zip(rank_shards, shard_indices):\n"
+        "      params_P = params_P.at[idx_Ps].set(shard_vals_Ps)\n"
+        "  return params_P"
+    )
 
 
-def zero1_update_shard(
-    params: np.ndarray,
-    grads: np.ndarray,
-    m: np.ndarray,
-    v: np.ndarray,
-    shard_indices: np.ndarray,
-    lr: float,
-    beta1: float = 0.9,
-    beta2: float = 0.999,
-    eps: float = 1e-8,
-    t: int = 1
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Apply an Adam update to only the parameters in shard_indices.
-    The optimizer states (m, v) are only maintained for shard_indices.
-    
-    Args:
-        params:        Full parameter array (n_params,) — modified in-place at shard_indices
-        grads:         Full gradient array (n_params,)
-        m:             Momentum for this shard (len(shard_indices),)
-        v:             Variance for this shard (len(shard_indices),)
-        shard_indices: Indices this rank is responsible for
-        lr, beta1, beta2, eps: Adam hyperparameters
-        t:             Current timestep (for bias correction)
-    
-    Returns:
-        (updated_params, new_m, new_v)  — params modified in-place
-    """
-    # TODO: Extract the gradient shard
-    g = None  # TODO: grads[shard_indices]
-    
-    # TODO: Adam moment updates
-    new_m = None  # TODO: beta1 * m + (1 - beta1) * g
-    new_v = None  # TODO: beta2 * v + (1 - beta2) * g**2
-    
-    # TODO: Bias-corrected estimates
-    m_hat = None  # TODO: new_m / (1 - beta1**t)
-    v_hat = None  # TODO: new_v / (1 - beta2**t)
-    
-    # TODO: Update only the shard of params
-    # params[shard_indices] -= lr * m_hat / (np.sqrt(v_hat) + eps)
-    
-    return params, new_m, new_v
+# ── Test ─────────────────────────────────────────────────────────────────────
+P, N = 12, 4
+shards_idx = [jnp.array(s) for s in np.array_split(np.arange(P), N)]
 
+params_P = jnp.ones(P)
+grads_P  = jnp.full(P, 0.1)
+lr_zero  = 0.01
 
-# Test ZeRO-1 sharding
-n_params, n_ranks = 10, 3
-shards = zero1_assign_shards(n_params, n_ranks)
+# Each rank updates only its own shard
+updated_shards, shard_vals = [], []
+for rank in range(N):
+    idx_Ps = shards_idx[rank]
+    m_Ps   = jnp.zeros(len(idx_Ps))
+    v_Ps   = jnp.zeros(len(idx_Ps))
+    p_updated_P, _, _ = zero1_adam_step_shard(
+        params_P, grads_P, m_Ps, v_Ps, idx_Ps, lr=lr_zero, t=1
+    )
+    shard_vals.append(p_updated_P[idx_Ps])    # extract only this rank's updated values
 
-print("Shard assignments:")
-for r, s in enumerate(shards):
-    print(f"  Rank {r}: params {s.tolist()}")
+# AllGather: reconstruct full params from all rank shards
+final_params_P = zero1_allgather(shard_vals, shards_idx, P)
 
-all_idx = np.sort(np.concatenate(shards))
-judge.check("Ex4a: All params assigned", all_idx, np.arange(n_params))
-judge.check("Ex4b: Max shard size difference <= 1",
-            max(len(s) for s in shards) - min(len(s) for s in shards) <= 1, True)
+# Reference: plain Adam on all params at once
+g_P      = grads_P
+m_ref_P  = (1 - 0.9)   * g_P
+v_ref_P  = (1 - 0.999) * g_P ** 2
+m_hat_P  = m_ref_P / (1 - 0.9)
+v_hat_P  = v_ref_P / (1 - 0.999)
+ref_P    = jnp.ones(P) - lr_zero * m_hat_P / (jnp.sqrt(v_hat_P) + 1e-8)
 
-# Test the update
-np.random.seed(1)
-params = np.ones(10)
-grads  = np.full(10, 0.1)
-shard0 = shards[0]  # e.g., [0,1,2,3]
-m0 = np.zeros(len(shard0))
-v0 = np.zeros(len(shard0))
-
-params, m0, v0 = zero1_update_shard(params, grads, m0, v0, shard0, lr=0.01, t=1)
-print(f"\nAfter update, params[0]: {params[0]:.6f} (expected ~0.9)")
-print(f"Params outside shard unchanged: {np.all(params[shard0[-1]+1:] == 1.0)}")
-judge.check("Ex4c: Shard updated correctly",
-            abs(params[0] - (1.0 - 0.01)) < 0.005, True)
-judge.check("Ex4d: Non-shard params untouched",
-            float(np.all(params[shards[1]] == 1.0)), 1.0)
+judge.check("Ex4a: shard 0 updated",         bool(jnp.any(final_params_P[shards_idx[0]] != 1.0)), True)
+judge.check("Ex4b: shard 1 updated",         bool(jnp.any(final_params_P[shards_idx[1]] != 1.0)), True)
+judge.check("Ex4c: allgather shape correct", final_params_P.shape,                                 (P,))
+judge.check("Ex4d: matches reference Adam",  final_params_P,                                        ref_P)
 
 # %% [markdown]
 # <details>
-# <summary>💡 Hint — zero1_assign_shards</summary>
+# <summary>💡 Hint — zero1_adam_step_shard</summary>
 #
 # ```python
-# return np.array_split(np.arange(n_params), n_ranks)
+# g_Ps     = grads_P[shard_idx_Ps]
+# new_m_Ps = beta1 * m_Ps + (1 - beta1) * g_Ps
+# new_v_Ps = beta2 * v_Ps + (1 - beta2) * g_Ps ** 2
+# m_hat_Ps = new_m_Ps / (1 - beta1 ** t)
+# v_hat_Ps = new_v_Ps / (1 - beta2 ** t)
+# params_P = params_P.at[shard_idx_Ps].add(-lr * m_hat_Ps / (jnp.sqrt(v_hat_Ps) + eps))
+# return params_P, new_m_Ps, new_v_Ps
 # ```
 # </details>
 #
 # <details>
-# <summary>💡 Hint — zero1_update_shard</summary>
+# <summary>💡 Hint — zero1_allgather</summary>
 #
 # ```python
-# g = grads[shard_indices]
-# new_m = beta1 * m + (1 - beta1) * g
-# new_v = beta2 * v + (1 - beta2) * g**2
-# m_hat = new_m / (1 - beta1**t)
-# v_hat = new_v / (1 - beta2**t)
-# params[shard_indices] -= lr * m_hat / (np.sqrt(v_hat) + eps)
-# return params, new_m, new_v
+# params_P = jnp.zeros(n_params)
+# for shard_vals_Ps, idx_Ps in zip(rank_shards, shard_indices):
+#     params_P = params_P.at[idx_Ps].set(shard_vals_Ps)
+# return params_P
 # ```
 # </details>
 #
@@ -661,10 +829,25 @@ judge.summary()
 # ---
 # ## Key Takeaways
 #
-# 1. **Data parallelism** replicates the model across GPUs and splits the data. Easy to implement, scales well to 100s of GPUs.
-# 2. **Ring-AllReduce** is bandwidth-optimal: each GPU's communication cost is constant regardless of number of GPUs.
-# 3. **Gradient accumulation** lets you simulate larger effective batch sizes without extra memory.
-# 4. **ZeRO-1/2/3** progressively shard optimizer states, gradients, and weights — enabling training of models much larger than a single GPU's memory.
+# 1. **Gradient = partial sum.** `dW_DxF = einsum("bsd,bsf->df", X, δ)` sums over the
+#    batch, giving shape `[D, F]` — same as W. Each entry `dW[d,f]` updates exactly `W[d,f]`.
+#    Without AllReduce, each GPU applies a different `dW` and model copies diverge.
+#
+# 2. **AllReduce averages element-wise along the W axis:** `[W, D, F] → [D, F]`.
+#    D and F are unchanged. Ring-AllReduce is bandwidth-optimal (`≈2P` per worker,
+#    independent of N). JAX exposes this as `jax.lax.pmean` inside `jax.pmap` —
+#    XLA emits the ring algorithm automatically.
+#
+# 3. **JAX is SPMD-only — no parameter server.** `pmap` maps computation across devices;
+#    `lax.pmean/psum/all_gather/reduce_scatter` are the collective primitives.
+#
+# 4. **Gradient accumulation** sums `jax.value_and_grad` outputs over micro-batches
+#    before a single `optimizer.update` — mathematically equivalent to training on the
+#    full effective batch.
+#
+# 5. **ZeRO-1** shards optimizer states: each rank updates 1/N of the params locally,
+#    then AllGather reconstructs the full model. ZeRO-2 additionally shards gradients;
+#    ZeRO-3 shards weights too, AllGathering on demand at every layer.
 #
 # ---
 # **Next:** [Chapter 3 — Model Parallelism](./chapter_03_model_parallelism.ipynb)

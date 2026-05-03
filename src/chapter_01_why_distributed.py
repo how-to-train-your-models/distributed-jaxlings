@@ -178,40 +178,9 @@
 #
 
 # %%
-class Judge:
-    """Exercise validator for Chapter 1."""
-    
-    def __init__(self):
-        self.passed = 0
-        self.failed = 0
+from judge import Judge
 
-    def check(self, exercise_name, got, expected, tol=0.01):
-        """Check a numeric answer within tolerance."""
-        if isinstance(expected, (int, float)):
-            err = abs(got - expected) / (abs(expected) + 1e-9)
-            ok = err < tol
-        else:
-            ok = got == expected
-        
-        if ok:
-            self.passed += 1
-            print(f"✅ {exercise_name}: PASSED")
-        else:
-            self.failed += 1
-            print(f"❌ {exercise_name}: FAILED — got {got}, expected {expected}")
-        return ok
-
-    def summary(self):
-        total = self.passed + self.failed
-        print(f"\n{'='*40}")
-        print(f"  Results: {self.passed}/{total} exercises passed")
-        if self.failed == 0:
-            print("  🎉 All exercises complete!")
-        else:
-            print(f"  Keep going — {self.failed} exercise(s) remaining.")
-        print('='*40)
-
-judge = Judge()
+judge = Judge("Chapter 1", default_tol=0.01)
 print("Judge loaded. Let's go!")
 
 

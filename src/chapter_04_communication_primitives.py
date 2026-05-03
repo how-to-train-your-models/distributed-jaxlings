@@ -76,31 +76,9 @@
 # %%
 import numpy as np
 from typing import List, Optional
+from judge import Judge
 
-class Judge:
-    def __init__(self):
-        self.passed = 0; self.failed = 0
-
-    def check(self, name, got, expected, tol=1e-6):
-        if isinstance(expected, np.ndarray):
-            ok = np.allclose(got, expected, atol=tol)
-        elif isinstance(expected, list):
-            ok = all(np.allclose(g, e, atol=tol) for g, e in zip(got, expected))
-        else:
-            ok = bool(got) == bool(expected) if isinstance(expected, bool) else abs(float(got)-float(expected)) < tol
-        if ok:
-            self.passed += 1; print(f"✅ {name}: PASSED")
-        else:
-            self.failed += 1; print(f"❌ {name}: FAILED — got {got!r}, expected {expected!r}")
-        return ok
-
-    def summary(self):
-        total = self.passed + self.failed
-        print(f"\n{'='*40}\n  Results: {self.passed}/{total} passed")
-        print("  🎉 Chapter 4 complete!" if self.failed==0 else f"  {self.failed} remaining.")
-        print('='*40)
-
-judge = Judge()
+judge = Judge("Chapter 4", default_tol=1e-6)
 print("Judge ready!")
 
 

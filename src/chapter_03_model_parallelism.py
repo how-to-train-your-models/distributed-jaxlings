@@ -145,36 +145,9 @@
 
 # %%
 import numpy as np
+from judge import Judge
 
-class Judge:
-    def __init__(self):
-        self.passed = 0
-        self.failed = 0
-
-    def check(self, name, got, expected, tol=1e-5):
-        if isinstance(expected, np.ndarray):
-            ok = np.allclose(got, expected, atol=tol)
-        elif isinstance(expected, (int, float)):
-            ok = abs(float(got) - float(expected)) / (abs(float(expected)) + 1e-9) < tol
-        else:
-            ok = bool(got) == bool(expected)
-        if ok:
-            self.passed += 1
-            print(f"✅ {name}: PASSED")
-        else:
-            self.failed += 1
-            print(f"❌ {name}: FAILED — got {got!r}, expected {expected!r}")
-        return ok
-
-    def summary(self):
-        total = self.passed + self.failed
-        print(f"\n{'='*40}")
-        print(f"  Results: {self.passed}/{total} passed")
-        print("  🎉 Chapter 3 complete!" if self.failed == 0
-              else f"  {self.failed} remaining.")
-        print('='*40)
-
-judge = Judge()
+judge = Judge("Chapter 3")
 print("Judge ready!")
 
 # %% [markdown]

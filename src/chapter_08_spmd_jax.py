@@ -139,33 +139,9 @@ print(f"Devices: {jax.device_count()}")
 import jax
 import jax.numpy as jnp
 import numpy as np
+from judge import Judge
 
-class Judge:
-    def __init__(self):
-        self.passed = 0; self.failed = 0
-
-    def check(self, name, got, expected, tol=1e-4):
-        if isinstance(expected, bool):
-            ok = bool(got) == expected
-        elif isinstance(expected, tuple):
-            ok = tuple(got) == expected
-        elif hasattr(expected, 'shape') or isinstance(expected, np.ndarray):
-            ok = np.allclose(np.array(got), np.array(expected), atol=tol)
-        else:
-            ok = abs(float(np.array(got).flat[0]) - float(expected)) / (abs(float(expected)) + 1e-9) < tol
-        if ok:
-            self.passed += 1; print(f"✅ {name}: PASSED")
-        else:
-            self.failed += 1; print(f"❌ {name}: FAILED — got {got!r}, expected {expected!r}")
-        return ok
-
-    def summary(self):
-        total = self.passed + self.failed
-        print(f"\n{'='*40}\n  Results: {self.passed}/{total} passed")
-        print("  🎉 Chapter 8 complete!" if self.failed==0 else f"  {self.failed} remaining.")
-        print('='*40)
-
-judge = Judge()
+judge = Judge("Chapter 8", default_tol=1e-4)
 print("Judge ready!")
 
 # %% [markdown]
