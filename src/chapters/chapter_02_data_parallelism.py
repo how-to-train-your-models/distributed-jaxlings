@@ -289,7 +289,7 @@ judge.check(shard_model_and_batch)
 #
 
 # %% [markdown]
-# ### Exercise 4 — The train step
+# ### Exercise 2 — The train step
 #
 # Implement `loss_fn(model, batch)` (next-token cross-entropy) and `train_step(model,
 # opt_state, batch)` that returns updated `(model, opt_state, loss)`.
@@ -409,7 +409,7 @@ print("Generated tokens (first 30):", sample[:30])
 
 
 # %% [markdown]
-# ### Exercise 5 — Throughput benchmark
+# ### Exercise 3 — Throughput benchmark
 #
 # Measure tokens/sec across `1, 2, 4, 8` (simulated) devices. Plot or print the scaling
 # curve and explain where it falls off.
