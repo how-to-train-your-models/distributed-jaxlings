@@ -180,29 +180,7 @@ print("Leaves:", jax.tree.leaves(lin))
 
 # %% [markdown]
 # ---
-# ## 5. The Tiny GPT (provided)
-#
-# The transformer itself is not the focus of this chapter — distributed training is.
-# `Block`, `TinyGPT`, and `sinusoidal_positions` are imported from `src.common.models`
-# and reused across later chapters. The architecture is deliberately naive:
-#
-# - Token embedding `(V, E)` + sinusoidal positional encoding `(S, E)`
-# - N × `Block`:
-#     - LayerNorm → `eqx.nn.MultiheadAttention` → residual
-#     - LayerNorm → MLP (`E → 4E → E`, GeLU) → residual
-# - Final LayerNorm → LM head `(E, V)` (untied for simplicity)
-#
-# Have a look at `src/common/models.py` to familiarize yourself with the implementation.
-#
-
-# %%
-print("Block:", Block)
-print("TinyGPT:", TinyGPT)
-
-
-# %% [markdown]
-# ---
-# ## 6. Meshes and Sharding
+# ## 5. Meshes and Sharding
 #
 # JAX's explicit parallelism story is built on three primitives:
 #
@@ -219,13 +197,45 @@ print("TinyGPT:", TinyGPT)
 devices = np.array(jax.devices())
 mesh = Mesh(devices, axis_names=('data',))
 
-replicated = NamedSharding(mesh, P())
-sharded_batch = NamedSharding(mesh, P('data'))
+sharding_replicated = NamedSharding(mesh, P())
+sharding_batch = NamedSharding(mesh, P('data'))
 
 print(f"Mesh: {mesh}")
 print(f"Replicated sharding: {replicated}")
 print(f"Sharded-batch sharding: {sharded_batch}")
 
+
+# %% [markdown]
+# ---
+# ## 5. The Tiny GPT
+#
+# We've implemented a tiny GPT model for our experiments in this chapter.
+# `Block`, `TinyGPT`, and `sinusoidal_positions` are imported from `src.common.models`
+# and reused across later chapters. The architecture is deliberately naive:
+#
+# - Token embedding `(V, E)` + sinusoidal positional encoding `(S, E)`
+# - N × `Block`:
+#     - LayerNorm → `eqx.nn.MultiheadAttention` → residual
+#     - LayerNorm → MLP (`E → 4E → E`, GeLU) → residual
+# - Final LayerNorm → LM head `(E, V)` (untied for simplicity)
+#
+# Have a look at `src/common/models.py` to familiarize yourself with the implementation.
+#
+
+# %%
+# --- Hyperparams for the tiny GPT ---
+VOCAB_SIZE = 256       # byte-level for simplicity
+EMBED_DIM  = 128
+NUM_HEADS  = 4
+NUM_LAYERS = 2
+MAX_SEQ    = 64
+BATCH_SIZE = len(jax.devices())  # global batch — always divisible by device count
+
+# Build model and put it through the sharding helper.
+seed = 42
+model = TinyGPT(VOCAB_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS, MAX_SEQ,
+                key=jax.random.key(seed))
+eqx.tree_pprint(model)
 
 # %% [markdown]
 # ### Exercise 1 — Shard a batch and replicate params
@@ -236,14 +246,6 @@ print(f"Sharded-batch sharding: {sharded_batch}")
 #
 
 # %%
-# --- Hyperparams for the tiny GPT ---
-VOCAB_SIZE = 256       # byte-level for simplicity
-EMBED_DIM  = 128
-NUM_HEADS  = 4
-NUM_LAYERS = 2
-MAX_SEQ    = 64
-BATCH_SIZE = 8         # global batch (must be divisible by number of devices)
-
 def shard_model_and_batch(model, tokens_BxS, mesh):
     """Replicate model arrays across devices; shard tokens along mesh axis 'data'.
 
@@ -252,12 +254,7 @@ def shard_model_and_batch(model, tokens_BxS, mesh):
     # TODO: build a `replicated` NamedSharding (P()) and a `batch_sh` NamedSharding
     # (P('data', None)). Walk the model with jax.tree.map and jax.device_put each
     # array leaf onto `replicated`. Place tokens_BxS onto `batch_sh`.
-    raise 
-
-
-# Build model and put it through the sharding helper.
-model = TinyGPT(VOCAB_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS, MAX_SEQ,
-                key=jax.random.PRNGKey(0))
+    raise NotImplementedError("TODO: implement shard_model_and_batch")
 
 # Set inference mode so Dropout.inference is handled as static by eqx.filter_jit.
 # (No dropout in this simple model — Ch 10 uses dropout with proper key handling.)
