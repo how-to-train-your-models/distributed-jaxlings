@@ -22,28 +22,27 @@
 # ---
 #
 # ## Chapter Summary
+# 
 #
-# A **tiny GPT** (~1–5M params) trained on **TinyStories** across N devices using
-# data parallelism. Architecture is deliberately *naive*: token + sinusoidal positional
-# embeddings, vanilla multi-head attention, LayerNorm, GeLU MLP. Ch 10 revisits with a
-# proper mini-Llama (RoPE, GQA, RMSNorm, SwiGLU, sharded init), so we keep this one
-# minimal on purpose.
-#
-# **Real-world hook:** every modern LLM (Claude, GPT, Gemini) is this same shape, scaled
-# up and trained DP. TinyStories (Eldan & Li, 2023) showed that even 1–10M-param
-# transformers produce coherent prose — so we get a "wow" sample at the end without
-# needing real scale.
-#
-# ## Learning Objectives
+# The reader is expected to be familar with jax basics. But we quickly go over the main 
+# concepts of jax which are helpful for distributed training. 
+# 
+# We also Have a quick introduction to equinox - a library for building neural networks in jax. 
+# We choose equinox over flax and other popular libraries because because of it's minimal API 
+# and the fact that it uses jax native Pytree API for representing models(Modules). This makes most 
+# of the jax concepts directly applicable to equinox models and distibuted concepts easier to learn.
+# 
+# The main point of this chapter is to take a simple working example and then  
+# gradually convert it to use distributed training.
+# 
+## Learning Objectives
 #
 # By the end of this chapter you will be able to:
 # - Write JAX functions and use `jit`, `grad`, `vmap` on them
 # - Build models as `eqx.Module` and use `eqx.filter_jit` / `eqx.filter_grad`
 # - Construct a `Mesh` and annotate tensors with `PartitionSpec` / `NamedSharding`
 # - Implement the data-parallel training loop (replicated params, sharded batch)
-# - Reason about the sync-vs-async tradeoff and why we don't use `pmap` anymore
 #
-# ---
 
 # %% [markdown]
 # ## Setup
@@ -67,9 +66,8 @@ import optax
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
-
-
 from judge import Judge
+from src.common.models import Block, TinyGPT, sinusoidal_positions
 
 judge = Judge("Chapter 2", test_module="tests.test_chapter_02")
 print(f"JAX devices: {jax.devices()}")
@@ -96,7 +94,7 @@ print(f"JAX devices: {jax.devices()}")
 #   GPU 3: model | b3 → dW_3 ─┘
 # ```
 #
-# In modern JAX you do not write the AllReduce explicitly — the compiler inserts it for
+# In JAX you don't have to write the AllReduce explicitly — the compiler inserts it for
 # you when you tell it the params are replicated and the batch is sharded. Most of this
 # chapter is about telling the compiler exactly that.
 #
@@ -152,16 +150,16 @@ print("random:", jax.random.normal(subkey, (3,)))
 # **are** pytrees, JAX transforms work on them out of the box — and so does our sharding
 # machinery later in the chapter.
 #
-# Two helpers we'll use everywhere:
+# There are two helpers in equinox, which are worth knowing as we'll use them everywhere:
 #
 # - `eqx.filter_jit(fn)` — like `jax.jit`, but only traces array leaves and treats
-#   non-array leaves (ints, strings, booleans) as static. Avoids confusing tracing
-#   errors when a module field isn't a `jax.Array`.
+#   non-array leaves (ints, strings, booleans) as static. This avoids confusing tracing
+#   errors when a module has fields which are not jax.arrays.
 # - `eqx.filter_value_and_grad(fn)` — like `jax.value_and_grad`, but only differentiates
-#   the array leaves of the model.
+#   the array leaves of the model. Non-array leaves are ignored for gradient computation.
 #
 # Optional: `eqx.partition` / `eqx.combine` to split a module into "differentiable" and
-# "static" halves explicitly. Useful for advanced patterns.
+# "static" halves explicitly.
 #
 
 # %%
@@ -182,123 +180,31 @@ print("Leaves:", jax.tree.leaves(lin))
 
 # %% [markdown]
 # ---
-# ## 5. The Tiny GPT
+# ## 5. The Tiny GPT (provided)
 #
-# Naive transformer block:
+# The transformer itself is not the focus of this chapter — distributed training is.
+# `Block`, `TinyGPT`, and `sinusoidal_positions` are imported from `src.common.models`
+# and reused across later chapters. The architecture is deliberately naive:
+#
 # - Token embedding `(V, E)` + sinusoidal positional encoding `(S, E)`
 # - N × `Block`:
 #     - LayerNorm → `eqx.nn.MultiheadAttention` → residual
 #     - LayerNorm → MLP (`E → 4E → E`, GeLU) → residual
 # - Final LayerNorm → LM head `(E, V)` (untied for simplicity)
 #
-#
-
-# %% [markdown]
-# ### Exercise 1 — The transformer block
-#
-# Build a `Block` Equinox module containing pre-LayerNorm attention + pre-LayerNorm MLP,
-# both with residual connections. Use `eqx.nn.MultiheadAttention` for the attention.
+# Have a look at `src/common/models.py` to familiarize yourself with the implementation.
 #
 
 # %%
-class Block(eqx.Module):
-    attn: eqx.nn.MultiheadAttention
-    mlp_in: eqx.nn.Linear
-    mlp_out: eqx.nn.Linear
-    ln1: eqx.nn.LayerNorm
-    ln2: eqx.nn.LayerNorm
-
-    def __init__(self, embed_dim: int, num_heads: int, *, key):
-        k1, k2, k3 = jax.random.split(key, 3)
-        self.attn = eqx.nn.MultiheadAttention(
-            num_heads=num_heads, query_size=embed_dim, inference=True, key=k1,
-        )
-        self.mlp_in = eqx.nn.Linear(embed_dim, 4 * embed_dim, key=k2)
-        self.mlp_out = eqx.nn.Linear(4 * embed_dim, embed_dim, key=k3)
-        self.ln1 = eqx.nn.LayerNorm(embed_dim)
-        self.ln2 = eqx.nn.LayerNorm(embed_dim)
-
-    def __call__(self, x_SxE: jax.Array, *, key=None) -> jax.Array:
-        S = x_SxE.shape[0]
-        mask_SxS = jnp.tril(jnp.ones((S, S)))          # causal mask
-
-        # Pre-LN attention + residual
-        h_SxE = jax.vmap(self.ln1)(x_SxE)
-        h_SxE = self.attn(h_SxE, h_SxE, h_SxE, mask=mask_SxS)
-        x_SxE = x_SxE + h_SxE
-
-        # Pre-LN MLP + residual
-        h_SxE = jax.vmap(self.ln2)(x_SxE)
-        h_SxE = jax.nn.gelu(jax.vmap(self.mlp_in)(h_SxE))
-        h_SxE = jax.vmap(self.mlp_out)(h_SxE)
-        x_SxE = x_SxE + h_SxE
-        return x_SxE
-
-
-# %%
-judge.check(Block)
-
-
-# %% [markdown]
-# ### Exercise 2 — The tiny GPT
-#
-# Compose embedding + sinusoidal positions + N blocks + final LN + LM head into a
-# `TinyGPT` Equinox module.
-#
-
-# %%
-class TinyGPT(eqx.Module):
-    tok_emb: eqx.nn.Embedding
-    pos_emb: jax.Array                     # non-trainable sinusoidal table
-    blocks: tuple
-    ln_f: eqx.nn.LayerNorm
-    lm_head: eqx.nn.Linear
-
-    def __init__(self, vocab_size: int, embed_dim: int, num_heads: int,
-                 num_layers: int, max_seq: int, *, key):
-        keys = jax.random.split(key, num_layers + 2)
-        self.tok_emb = eqx.nn.Embedding(vocab_size, embed_dim, key=keys[0])
-        self.pos_emb = sinusoidal_positions(max_seq, embed_dim)
-        self.blocks = tuple(
-            Block(embed_dim, num_heads, key=keys[i + 1])
-            for i in range(num_layers)
-        )
-        self.ln_f = eqx.nn.LayerNorm(embed_dim)
-        self.lm_head = eqx.nn.Linear(embed_dim, vocab_size, key=keys[-1])
-
-    def __call__(self, tokens_S: jax.Array, *, key=None) -> jax.Array:
-        """Single-example forward: tokens_S is int[S]. Returns logits_SxV."""
-        S = tokens_S.shape[0]
-        x_SxE = jax.vmap(self.tok_emb)(tokens_S) + self.pos_emb[:S]
-        for block in self.blocks:
-            x_SxE = block(x_SxE, key=key)
-        x_SxE = jax.vmap(self.ln_f)(x_SxE)
-        logits_SxV = jax.vmap(self.lm_head)(x_SxE)
-        return logits_SxV
-
-
-def sinusoidal_positions(max_seq: int, dim: int) -> jax.Array:
-    """Standard 'Attention is All You Need' positional encoding table of shape (max_seq, dim)."""
-    pos = jnp.arange(max_seq)[:, None]                       # (S, 1)
-    i = jnp.arange(0, dim, 2)[None, :]                       # (1, dim//2)
-    angle_rates = 1 / (10000 ** (i / dim))                    # (1, dim//2)
-    angles = pos * angle_rates                                # (S, dim//2)
-    # Interleave sin and cos: even indices = sin, odd indices = cos.
-    pe = jnp.zeros((max_seq, dim))
-    pe = pe.at[:, 0::2].set(jnp.sin(angles))
-    pe = pe.at[:, 1::2].set(jnp.cos(angles))
-    return pe
-
-
-# %%
-judge.check(TinyGPT)
+print("Block:", Block)
+print("TinyGPT:", TinyGPT)
 
 
 # %% [markdown]
 # ---
 # ## 6. Meshes and Sharding
 #
-# JAX's modern parallelism story is built on three primitives:
+# JAX's parallelism story is built on three primitives:
 #
 # - `Mesh` — a logical grid of devices with **named axes** (e.g. `data`, `model`).
 # - `PartitionSpec` (alias `P`) — for each tensor dim, which mesh axis (if any) shards it.
@@ -322,7 +228,7 @@ print(f"Sharded-batch sharding: {sharded_batch}")
 
 
 # %% [markdown]
-# ### Exercise 3 — Shard a batch and replicate params
+# ### Exercise 1 — Shard a batch and replicate params
 #
 # Given the `mesh` above and a `TinyGPT` instance, place the model with `replicated`
 # sharding and a batch tensor with `sharded_batch`. Confirm with
@@ -339,20 +245,20 @@ MAX_SEQ    = 64
 BATCH_SIZE = 8         # global batch (must be divisible by number of devices)
 
 def shard_model_and_batch(model, tokens_BxS, mesh):
-    """Replicate model arrays across devices; shard tokens along mesh axis 'data'."""
-    replicated = NamedSharding(mesh, P())
-    batch_sh = NamedSharding(mesh, P('data', None))
-    model = jax.tree.map(
-        lambda x: jax.device_put(x, replicated) if eqx.is_array(x) else x,
-        model,
-    )
-    tokens_BxS = jax.device_put(tokens_BxS, batch_sh)
-    return model, tokens_BxS
+    """Replicate model arrays across devices; shard tokens along mesh axis 'data'.
+
+    Returns (sharded_model, sharded_tokens_BxS).
+    """
+    # TODO: build a `replicated` NamedSharding (P()) and a `batch_sh` NamedSharding
+    # (P('data', None)). Walk the model with jax.tree.map and jax.device_put each
+    # array leaf onto `replicated`. Place tokens_BxS onto `batch_sh`.
+    raise NotImplementedError
 
 
 # Build model and put it through the sharding helper.
 model = TinyGPT(VOCAB_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS, MAX_SEQ,
                 key=jax.random.PRNGKey(0))
+
 # Set inference mode so Dropout.inference is handled as static by eqx.filter_jit.
 # (No dropout in this simple model — Ch 10 uses dropout with proper key handling.)
 model = eqx.nn.inference_mode(model)
@@ -392,23 +298,18 @@ judge.check(shard_model_and_batch)
 # %%
 def loss_fn(model: TinyGPT, batch: dict) -> jax.Array:
     """Next-token cross-entropy. batch = {'tokens_BxS': int[B,S], 'targets_BxS': int[B,S]}."""
-    logits_BxSxV = jax.vmap(model)(batch['tokens_BxS'])
-    # Per-token cross-entropy, then mean over all (B, S) positions.
-    loss_BxS = optax.softmax_cross_entropy_with_integer_labels(
-        logits_BxSxV, batch['targets_BxS']
-    )
-    return jnp.mean(loss_BxS)
+    # TODO: vmap the model across the batch dim to produce logits_BxSxV, then take the
+    # mean of optax.softmax_cross_entropy_with_integer_labels(logits_BxSxV, targets).
+    raise NotImplementedError
 
 
 @functools.partial(jax.jit, static_argnames=('static', 'optimizer'))
 def train_step(params, static, opt_state, batch, optimizer):
     """DP train step. Params and static are the two halves of eqx.partition."""
-    model = eqx.combine(params, static)
-    loss, grads = eqx.filter_value_and_grad(loss_fn)(model, batch)
-    grad_params, _ = eqx.partition(grads, eqx.is_array)
-    updates, opt_state = optimizer.update(grad_params, opt_state, params)
-    params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
+    # TODO: recombine params + static, take eqx.filter_value_and_grad of loss_fn,
+    # filter the grads to array leaves, call optimizer.update, then optax.apply_updates.
+    # Return (params, opt_state, loss).
+    raise NotImplementedError
 
 
 # %%
@@ -433,12 +334,10 @@ judge.check(train_step)
 # %% [markdown]
 # ---
 # ## Sidebar: `pmap` is legacy
-#
-# Older JAX code  used `jax.pmap` and`jax.lax.pmean` for data parallelism. 
-# Don't write new code with `pmap` — it doesn't compose with `Mesh`/`PartitionSpec`,
-# doesn't generalize to TP/PP/FSDP, and is effectively in maintenance mode.
+
+# You might see older codebases in jax use `pmap` for data parallelism, but we intentionally don't discuss 
+# `pmap` because it's less composable than `Mesh` and not the recommended way to do data parallelism in JAX, anymore. 
 # Everything here is `jit` + sharding from the start.
-#
 
 # %% [markdown]
 # ---
@@ -582,10 +481,9 @@ judge.summary()
 # ## Key Takeaways
 #
 # 1. Data parallelism replicates the model and shards the batch. Gradient AllReduce is
-#    inserted by the JAX compiler when you correctly annotate sharding — you do not
-#    write the collective.
-# 2. Equinox modules are pytrees, so `Mesh` + `PartitionSpec` + `NamedSharding` works on
-#    them with no special framework support.
+#    inserted by the JAX compiler (we'll learn more about this in next chapter)
+# 2. Using `Mesh` + `PartitionSpec` + `NamedSharding` on pytrees and jitted functions
+#    can achieve DDP on multiple devices. (Equinox modules are also pytrees).
 # 3. `eqx.filter_jit` and `eqx.filter_value_and_grad` are the day-to-day workhorses.
 # 4. `pmap` is legacy. Use `jit` + sharding for everything new.
 # 5. DP scales until activation memory or per-step communication dominates — the next
@@ -596,5 +494,3 @@ judge.summary()
 # learn the AllReduce / AllGather / ReduceScatter / ppermute primitives that the compiler
 # was inserting for you, and write them yourself with `shard_map`.
 #
-
-# %%
