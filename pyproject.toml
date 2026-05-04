@@ -23,4 +23,4 @@ dev = [
 testpaths = ["tests"]
 
 [tool.jupytext]
-formats = "src//py:percent,chapters//ipynb"
+formats = "src/chapters//py:percent,notebooks//ipynb"

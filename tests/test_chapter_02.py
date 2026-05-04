@@ -80,7 +80,7 @@ def test_TinyGPT__loss_near_log_vocab_at_init(TinyGPT):
 # -- shard_model_and_batch -------------------------------------------------
 
 def test_shard_model_and_batch__batch_sharded_on_data(shard_model_and_batch):
-    from exercises.chapter_02 import TinyGPT as RefTinyGPT
+    from src.exercises.chapter_02 import TinyGPT as RefTinyGPT
     model = RefTinyGPT(VOCAB_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS, MAX_SEQ,
                        key=jax.random.PRNGKey(0))
     tokens_BxS = jnp.zeros((BATCH_SIZE, MAX_SEQ), dtype=jnp.int32)
@@ -89,7 +89,7 @@ def test_shard_model_and_batch__batch_sharded_on_data(shard_model_and_batch):
 
 
 def test_shard_model_and_batch__model_replicated(shard_model_and_batch):
-    from exercises.chapter_02 import TinyGPT as RefTinyGPT
+    from src.exercises.chapter_02 import TinyGPT as RefTinyGPT
     model = RefTinyGPT(VOCAB_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS, MAX_SEQ,
                        key=jax.random.PRNGKey(0))
     tokens_BxS = jnp.zeros((BATCH_SIZE, MAX_SEQ), dtype=jnp.int32)
@@ -103,7 +103,7 @@ def test_shard_model_and_batch__model_replicated(shard_model_and_batch):
 # -- loss_fn ---------------------------------------------------------------
 
 def _ref_model():
-    from exercises.chapter_02 import TinyGPT as RefTinyGPT
+    from src.exercises.chapter_02 import TinyGPT as RefTinyGPT
     return RefTinyGPT(VOCAB_SIZE, EMBED_DIM, NUM_HEADS, NUM_LAYERS, MAX_SEQ,
                       key=jax.random.PRNGKey(0))
 

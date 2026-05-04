@@ -9,7 +9,7 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
 
 import pytest
 
-from exercises import chapter_02
+from src.exercises import chapter_02
 
 
 @pytest.fixture

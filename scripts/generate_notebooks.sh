@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Convert src/*.py → chapters/*.ipynb using jupytext.
-# Outputs are placed in chapters/ to preserve Colab links and existing structure.
+# Convert src/chapters/*.py → notebooks/*.ipynb using jupytext.
+# Outputs are placed in notebooks/ to preserve Colab links and existing structure.
 # Usage:
 #   ./scripts/generate_notebooks.sh          # regenerate all
 #   ./scripts/generate_notebooks.sh 01 03    # regenerate specific chapters by number
@@ -9,15 +9,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
-SRC="$ROOT/src"
-CHAPTERS="$ROOT/chapters"
+SRC="$ROOT/src/chapters"
+CHAPTERS="$ROOT/notebooks"
 
 JUPYTEXT="uv run jupytext"
 
 mkdir -p "$CHAPTERS"
 
 # Always sync the shared judge module so notebooks can import it
-cp "$SRC/judge.py" "$CHAPTERS/judge.py"
+cp "$ROOT/src/judge.py" "$CHAPTERS/judge.py"
 
 if [[ $# -eq 0 ]]; then
     # Regenerate all chapters
@@ -43,9 +43,9 @@ fi
 for py in "${files[@]}"; do
     name="$(basename "$py" .py)"
     out="$CHAPTERS/${name}.ipynb"
-    echo "Generating chapters/${name}.ipynb"
+    echo "Generating notebooks/${name}.ipynb"
     $JUPYTEXT --to notebook --output "$out" "$py"
 done
 
 echo ""
-echo "Done. Generated ${#files[@]} notebook(s) in chapters/."
+echo "Done. Generated ${#files[@]} notebook(s) in notebooks/."

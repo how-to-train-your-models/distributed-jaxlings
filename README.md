@@ -34,9 +34,14 @@ their keep — there is no standalone "JAX primitives" tour.
 ## Layout
 
 ```
-src/        # jupytext .py source for each chapter (edit here)
-chapters/   # generated .ipynb notebooks (Colab-runnable)
-scripts/    # notebook generation
+src/
+  chapters/   # jupytext .py source for each chapter (edit here)
+  exercises/  # exercise stubs / reference solutions per chapter
+  solutions/  # (reserved for future solution files)
+  judge.py    # shared exercise validator
+notebooks/    # generated .ipynb notebooks (Colab-runnable)
+tests/        # pytest test suite
+scripts/      # notebook generation
 ```
 
 ## Setup
