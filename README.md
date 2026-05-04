@@ -46,10 +46,18 @@ scripts/      # notebook generation
 
 ## Setup
 
-This project uses `uv`.
+This project uses `uv` for environment management.
+
+By default, the setup will install the CPU-only version of JAX:
 
 ```bash
 uv sync
+```
+
+**If you have an NVIDIA GPU**, install the `cuda` extra to enable GPU acceleration:
+
+```bash
+uv sync --extra cuda
 ```
 
 Each chapter is a self-contained Jupyter notebook runnable on Google Colab.

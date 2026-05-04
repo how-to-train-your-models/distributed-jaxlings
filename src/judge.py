@@ -13,8 +13,15 @@ Two calling styles, both spelled `judge.check(...)`:
 import importlib
 import re
 import traceback
+import sys
+import pathlib
 
 import numpy as np
+
+# Ensure the repository root is in sys.path so we can import `tests` dynamically.
+_repo_root = pathlib.Path(__file__).parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
 
 class Judge:
