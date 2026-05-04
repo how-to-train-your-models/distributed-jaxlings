@@ -16,8 +16,6 @@ JUPYTEXT="uv run jupytext"
 
 mkdir -p "$CHAPTERS"
 
-# Always sync the shared judge module so notebooks can import it
-cp "$ROOT/src/judge.py" "$CHAPTERS/judge.py"
 
 if [[ $# -eq 0 ]]; then
     # Regenerate all chapters
