@@ -13,9 +13,9 @@
 # ---
 
 # %% [markdown]
-# [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/how-to-train-your-models/distributed-jaxlings/blob/main/notebooks/chapter_01_why_distributed.ipynb)
+# [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/how-to-train-your-models/distributed-jaxlings/blob/main/notebooks/chapter_00_why_distributed.ipynb)
 #
-# # Chapter 1: Why Distributed Training?
+# # Chapter 0: Why Distributed Training?
 #
 # > **Course: Distributed Training in JAX** — built around JAX + Equinox + Optax + Orbax.
 #
@@ -83,7 +83,7 @@
 # ### Example: GPT-3 (175B params)
 # ```
 # Weights:    175B × 4 bytes = 700 GB
-# Gradients:  175B × 4 bytes = 700 GB  
+# Gradients:  175B × 4 bytes = 700 GB
 # Adam:       175B × 8 bytes = 1,400 GB
 # ─────────────────────────────────────
 # Total:                       2,800 GB  ≈ 35 × A100 80GB GPUs (minimum!)
@@ -136,7 +136,7 @@
 # GPU HBM (High Bandwidth Memory)  ← where tensors live (40-80GB on A100)
 #     ↕  ~2 TB/s bandwidth
 # L2 Cache                          ← 40MB on A100
-#     ↕  ~10 TB/s bandwidth  
+#     ↕  ~10 TB/s bandwidth
 # L1 Cache / Shared Memory          ← per SM, 192KB on A100
 #     ↕  ~20 TB/s bandwidth
 # Registers                         ← fastest, per thread
@@ -190,7 +190,7 @@ import pathlib
 
 from judge import Judge
 
-judge = Judge("Chapter 1", default_tol=0.01)
+judge = Judge("Chapter 0", default_tol=0.01)
 print("Judge loaded. Let's go!")
 
 
@@ -225,36 +225,36 @@ def count_transformer_params(
 ) -> int:
     """
     Calculate the total number of parameters in a GPT-style transformer.
-    
+
     Args:
         vocab_size:      Size of token vocabulary
         d_model:         Hidden dimension size
         n_layers:        Number of transformer layers
         max_seq_len:     Maximum sequence length (for position embeddings)
         tie_embeddings:  If True, LM head shares weights with token embedding
-    
+
     Returns:
         Total parameter count
     """
     # TODO: Calculate each component and sum them
-    
+
     # Embeddings
     token_emb = 0       # TODO
     pos_emb = 0         # TODO
-    
+
     # Per-layer components
     attn_params = 0     # TODO: Q, K, V, O projections (each d_model × d_model)
     mlp_params = 0      # TODO: two linear layers
     ln_params = 0       # TODO: 2 layer norms, each has scale + bias of size d_model
-    
+
     per_layer = attn_params + mlp_params + ln_params
-    
+
     # Final layer norm
     final_ln = 0        # TODO
-    
+
     # LM Head
     lm_head = 0         # TODO: 0 if tie_embeddings else vocab_size * d_model
-    
+
     total = token_emb + pos_emb + n_layers * per_layer + final_ln + lm_head
     return total
 
@@ -291,9 +291,9 @@ judge.check("Ex1: GPT-2 Small param count", gpt2_small, 124_439_808, tol=0.01)
 #
 # Recall:
 # - **FP32 training:** weights (4 bytes) + gradients (4 bytes) + Adam m (4 bytes) + Adam v (4 bytes) = **16 bytes/param**
-# - **Mixed precision (BF16/FP16):** 
+# - **Mixed precision (BF16/FP16):**
 #   - FP16 weights: 2 bytes/param
-#   - FP16 gradients: 2 bytes/param  
+#   - FP16 gradients: 2 bytes/param
 #   - FP32 master weights: 4 bytes/param
 #   - Adam m (FP32): 4 bytes/param
 #   - Adam v (FP32): 4 bytes/param
@@ -309,18 +309,18 @@ def training_memory_gb(n_params: int, mixed_precision: bool = False) -> float:
     """
     Estimate GPU memory (in GB) needed for training with Adam,
     excluding activation memory.
-    
+
     Args:
         n_params:         Number of model parameters
         mixed_precision:  If True, use mixed precision accounting
                           (note: total bytes/param is the same as FP32!)
-    
+
     Returns:
         Memory in gigabytes (GB, not GiB — use 1e9 not 1<<30)
     """
     # TODO: Calculate bytes per parameter
     bytes_per_param = 0  # TODO: same for both fp32 and mixed precision!
-    
+
     total_bytes = n_params * bytes_per_param
     return total_bytes / 1e9
 
@@ -358,26 +358,26 @@ def can_train_on_cluster(
     """
     Check if a model can be trained on a cluster using model parallelism
     (assuming model weights are perfectly sharded across all GPUs).
-    
+
     Args:
         n_params:        Number of model parameters
         n_gpus:          Total number of GPUs in the cluster
         gpu_memory_gb:   Memory per GPU in GB
         safety_margin:   Fraction of GPU memory usable (rest is for activations etc.)
-    
+
     Returns:
         (fits: bool, utilization: float) where utilization is fraction of total memory used
     """
     # TODO: Calculate total available memory across all GPUs (with safety margin)
     total_available_gb = 0  # TODO
-    
+
     # TODO: Calculate required memory
     required_gb = 0  # TODO: use training_memory_gb from Exercise 2
-    
+
     # TODO: Determine if it fits and compute utilization
     fits = False        # TODO
     utilization = 0.0  # TODO: required / total_available
-    
+
     return fits, utilization
 
 
@@ -401,7 +401,7 @@ judge.check("Ex3b: LLaMA-70B does NOT fit on 8xA100", fits2, False)
 #
 # **Model FLOP Utilization (MFU)** accounts for real-world inefficiencies (memory bandwidth, communication overhead). Typical values:
 # - Single GPU (no communication): ~50-60% MFU
-# - Multi-GPU with NVLink: ~45-55% MFU  
+# - Multi-GPU with NVLink: ~45-55% MFU
 # - Multi-node: ~35-45% MFU
 #
 # ```
@@ -419,28 +419,28 @@ def estimate_training_time(
 ) -> dict:
     """
     Estimate total training time.
-    
+
     Args:
         n_params:    Number of model parameters
         n_tokens:    Number of training tokens
         n_gpus:      Number of GPUs
         gpu_tflops:  Peak TFLOPS per GPU (for the precision used)
         mfu:         Model FLOP Utilization (0 to 1)
-    
+
     Returns:
         dict with keys: total_flops, effective_tflops, seconds, hours, days
     """
     # TODO: Calculate total FLOPs for the training run
     total_flops = 0  # TODO: 6 * n_params * n_tokens
-    
+
     # TODO: Calculate effective cluster throughput (FLOPs/second)
     effective_flops_per_sec = 0  # TODO: n_gpus * gpu_tflops * 1e12 * mfu
-    
+
     # TODO: Calculate time
     seconds = 0  # TODO
     hours = 0    # TODO
     days = 0     # TODO
-    
+
     return {
         "total_flops": total_flops,
         "effective_tflops": effective_flops_per_sec / 1e12,
@@ -551,8 +551,8 @@ judge.summary()
 #    different bottleneck. The rest of the course implements them one by one in JAX + Equinox.
 #
 # ---
-# **Next:** [Chapter 2 — Data Parallelism](./chapter_02_data_parallelism.ipynb) — train a tiny GPT on
-# TinyStories across N devices using `Mesh` + `PartitionSpec` + Equinox.
+# **Next:** [Chapter 1 — JAX, Equinox & TinyGPT](./chapter_01_jax_equinox_intro.ipynb) — a hands-on
+# tour of the JAX primitives and the TinyGPT model we'll use throughout the course.
 #
 
 # %%

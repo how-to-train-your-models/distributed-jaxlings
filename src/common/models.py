@@ -87,3 +87,30 @@ class TinyGPT(eqx.Module):
         x_SxE = jax.vmap(self.ln_f)(x_SxE)
         logits_SxV = jax.vmap(self.lm_head)(x_SxE)
         return logits_SxV
+
+
+def generate(
+    model: TinyGPT,
+    prompt: str | list[int],
+    max_new: int = 50,
+) -> str:
+    """Greedy autoregressive generation.
+
+    Args:
+        model:    A TinyGPT instance (byte-level, vocab=256).
+        prompt:   Either a plain string (encoded to UTF-8 bytes) or a list of
+                  raw byte values to use as the initial context.
+        max_new:  Number of new tokens to generate.
+
+    Returns:
+        The full sequence (prompt + generated tokens) decoded as a UTF-8 string.
+        Undecodable byte sequences are replaced with the U+FFFD replacement character.
+    """
+    max_seq = model.pos_emb.shape[0]
+    tokens: list[int] = list(prompt.encode("utf-8") if isinstance(prompt, str) else prompt)
+    for _ in range(max_new):
+        x_S = jnp.array(tokens[-max_seq:], dtype=jnp.int32)
+        logits_SxV = model(x_S)
+        next_token = int(jnp.argmax(logits_SxV[-1]))
+        tokens.append(next_token)
+    return bytes(tokens).decode("utf-8", errors="replace")

@@ -22,24 +22,13 @@
 # ---
 #
 # ## Chapter Summary
-# 
 #
-# The reader is expected to be familar with jax basics. But we quickly go over the main 
-# concepts of jax which are helpful for distributed training. 
-# 
-# We also Have a quick introduction to equinox - a library for building neural networks in jax. 
-# We choose equinox over flax and other popular libraries because because of it's minimal API 
-# and the fact that it uses jax native Pytree API for representing models(Modules). This makes most 
-# of the jax concepts directly applicable to equinox models and distibuted concepts easier to learn.
-# 
-# The main point of this chapter is to take a simple working example and then  
+# The main point of this chapter is to take a simple working example and then
 # gradually convert it to use distributed training.
-# 
-## Learning Objectives
+#
+# ## Learning Objectives
 #
 # By the end of this chapter you will be able to:
-# - Write JAX functions and use `jit`, `grad`, `vmap` on them
-# - Build models as `eqx.Module` and use `eqx.filter_jit` / `eqx.filter_grad`
 # - Construct a `Mesh` and annotate tensors with `PartitionSpec` / `NamedSharding`
 # - Implement the data-parallel training loop (replicated params, sharded batch)
 #
@@ -67,7 +56,7 @@ import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
 from judge import Judge
-from src.common.models import Block, TinyGPT, sinusoidal_positions
+from src.common.models import Block, TinyGPT, sinusoidal_positions, generate
 
 judge = Judge("Chapter 2", test_module="tests.test_chapter_02")
 print(f"JAX devices: {jax.devices()}")
@@ -101,86 +90,7 @@ print(f"JAX devices: {jax.devices()}")
 
 # %% [markdown]
 # ---
-# ## 2. JAX in Five Minutes — `jit`, `grad`, `vmap`
-#
-# JAX programs are **pure functions over arrays**. Three transforms do most of the work:
-#
-# - `jax.jit` — compile + optimize a function via XLA. First call traces; subsequent calls reuse the compiled artifact.
-# - `jax.grad` — automatic differentiation. Returns a function computing gradients w.r.t. the first arg.
-# - `jax.vmap` — vectorize over a batch dim without writing a loop.
-#
-# Examples:
-#
-
-# %%
-def f(x): return jnp.sin(x) ** 2
-
-print("jit:  ", jax.jit(f)(0.5))
-print("grad: ", jax.grad(f)(0.5))          # d/dx sin²x = 2 sin x cos x = sin 2x
-print("vmap: ", jax.vmap(f)(jnp.arange(5.0)))
-
-
-# %% [markdown]
-# ---
-# ## 3. Pytrees and PRNG
-#
-# - **Pytrees** are nested containers of arrays (tuples, lists, dicts, dataclasses). JAX
-#   transforms operate over pytrees transparently.
-# - **PRNG**: JAX has no global random state. You pass a `PRNGKey` and split it
-#   explicitly with `jax.random.split` — this makes randomness deterministic and
-#   parallelism-safe.
-#
-
-# %%
-tree = {"a": jnp.ones(3), "b": {"c": jnp.zeros(2)}}
-doubled = jax.tree.map(lambda x: x * 2, tree)
-print("doubled:", doubled)
-
-key = jax.random.PRNGKey(0)
-key, subkey = jax.random.split(key)
-print("random:", jax.random.normal(subkey, (3,)))
-
-
-# %% [markdown]
-# ---
-# ## 4. Equinox: Modules as Pytrees
-#
-# Equinox is a tiny library: an `eqx.Module` is a frozen dataclass that is *also* a
-# pytree. Fields can be `jax.Array`s, ints, strings, or sub-modules. Because modules
-# **are** pytrees, JAX transforms work on them out of the box — and so does our sharding
-# machinery later in the chapter.
-#
-# There are two helpers in equinox, which are worth knowing as we'll use them everywhere:
-#
-# - `eqx.filter_jit(fn)` — like `jax.jit`, but only traces array leaves and treats
-#   non-array leaves (ints, strings, booleans) as static. This avoids confusing tracing
-#   errors when a module has fields which are not jax.arrays.
-# - `eqx.filter_value_and_grad(fn)` — like `jax.value_and_grad`, but only differentiates
-#   the array leaves of the model. Non-array leaves are ignored for gradient computation.
-#
-# Optional: `eqx.partition` / `eqx.combine` to split a module into "differentiable" and
-# "static" halves explicitly.
-#
-
-# %%
-class Linear(eqx.Module):
-    w: jax.Array
-    b: jax.Array
-    def __init__(self, in_dim, out_dim, key):
-        k1, k2 = jax.random.split(key)
-        self.w = jax.random.normal(k1, (in_dim, out_dim)) / jnp.sqrt(in_dim)
-        self.b = jnp.zeros((out_dim,))
-    def __call__(self, x_BxI):
-        return x_BxI @ self.w + self.b
-
-lin = Linear(4, 8, jax.random.PRNGKey(42))
-print("Linear output shape:", lin(jnp.ones((2, 4))).shape)
-print("Leaves:", jax.tree.leaves(lin))
-
-
-# %% [markdown]
-# ---
-# ## 5. Meshes and Sharding
+# ## 2. Meshes and Sharding
 #
 # JAX's explicit parallelism story is built on three primitives:
 #
@@ -201,25 +111,16 @@ sharding_replicated = NamedSharding(mesh, P())
 sharding_batch = NamedSharding(mesh, P('data'))
 
 print(f"Mesh: {mesh}")
-print(f"Replicated sharding: {replicated}")
-print(f"Sharded-batch sharding: {sharded_batch}")
+print(f"Replicated sharding: {sharding_replicated}")
+print(f"Sharded-batch sharding: {sharding_batch}")
 
 
 # %% [markdown]
 # ---
-# ## 5. The Tiny GPT
+# ## 3. The Tiny GPT
 #
-# We've implemented a tiny GPT model for our experiments in this chapter.
-# `Block`, `TinyGPT`, and `sinusoidal_positions` are imported from `src.common.models`
-# and reused across later chapters. The architecture is deliberately naive:
-#
-# - Token embedding `(V, E)` + sinusoidal positional encoding `(S, E)`
-# - N × `Block`:
-#     - LayerNorm → `eqx.nn.MultiheadAttention` → residual
-#     - LayerNorm → MLP (`E → 4E → E`, GeLU) → residual
-# - Final LayerNorm → LM head `(E, V)` (untied for simplicity)
-#
-# Have a look at `src/common/models.py` to familiarize yourself with the implementation.
+# We use the `TinyGPT` model introduced in Chapter 1. Quick recap of the hyperparams
+# we'll use throughout this chapter:
 #
 
 # %%
@@ -274,7 +175,7 @@ judge.check(shard_model_and_batch)
 
 # %% [markdown]
 # ---
-# ## 7. The Data-Parallel Pattern
+# ## 4. The Data-Parallel Pattern
 #
 # The DP recipe in JAX:
 #
@@ -316,7 +217,7 @@ judge.check(train_step)
 
 # %% [markdown]
 # ---
-# ## 8. Sync vs Async, Large-Batch Tradeoffs
+# ## 5. Sync vs Async, Large-Batch Tradeoffs
 #
 # - **Synchronous SGD** (what we just built): every device waits for the AllReduce
 #   before the next step. Deterministic, easy to reason about, dominant in practice.
@@ -332,8 +233,8 @@ judge.check(train_step)
 # ---
 # ## Sidebar: `pmap` is legacy
 
-# You might see older codebases in jax use `pmap` for data parallelism, but we intentionally don't discuss 
-# `pmap` because it's less composable than `Mesh` and not the recommended way to do data parallelism in JAX, anymore. 
+# You might see older codebases in jax use `pmap` for data parallelism, but we intentionally don't discuss
+# `pmap` because it's less composable than `Mesh` and not the recommended way to do data parallelism in JAX, anymore.
 # Everything here is `jit` + sharding from the start.
 
 # %% [markdown]
@@ -391,18 +292,8 @@ print("-" * 60)
 model = eqx.combine(params, static)
 
 # --- Greedy generation to verify the model works ---
-def generate(model, prompt_tokens, max_new: int = 50):
-    """Greedy autoregressive generation."""
-    tokens = list(prompt_tokens)
-    for _ in range(max_new):
-        x = jnp.array(tokens[-MAX_SEQ:])[None, :]          # (1, <=S)
-        logits_1xSxV = jax.vmap(model)(x)
-        next_token = int(jnp.argmax(logits_1xSxV[0, -1]))
-        tokens.append(next_token)
-    return tokens
-
-sample = generate(model, [1, 2, 3], max_new=50)
-print("Generated tokens (first 30):", sample[:30])
+sample = generate(model, "Once upon a time", max_new=50)
+print("Generated text:", sample)
 
 
 # %% [markdown]
