@@ -204,7 +204,7 @@ print("TinyGPT:", TinyGPT)
 # ---
 # ## 6. Meshes and Sharding
 #
-# JAX's parallelism story is built on three primitives:
+# JAX's explicit parallelism story is built on three primitives:
 #
 # - `Mesh` — a logical grid of devices with **named axes** (e.g. `data`, `model`).
 # - `PartitionSpec` (alias `P`) — for each tensor dim, which mesh axis (if any) shards it.
@@ -252,7 +252,7 @@ def shard_model_and_batch(model, tokens_BxS, mesh):
     # TODO: build a `replicated` NamedSharding (P()) and a `batch_sh` NamedSharding
     # (P('data', None)). Walk the model with jax.tree.map and jax.device_put each
     # array leaf onto `replicated`. Place tokens_BxS onto `batch_sh`.
-    raise NotImplementedError
+    raise 
 
 
 # Build model and put it through the sharding helper.
