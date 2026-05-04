@@ -5,9 +5,10 @@ description = "Distributed Training with JAX - course notebooks"
 requires-python = ">=3.10"
 dependencies = [
     "jax[cpu]",
-    "flax",
     "optax",
     "numpy",
+    "equinox>=0.13.7",
+    "rich>=15.0.0",
 ]
 
 [dependency-groups]
@@ -15,7 +16,11 @@ dev = [
     "jupytext",
     "jupyter",
     "notebook",
+    "pytest",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.jupytext]
 formats = "src//py:percent,chapters//ipynb"
