@@ -30,8 +30,16 @@ class Judge:
         self.chapter = chapter
         self.test_module = test_module
         self.default_tol = default_tol
-        self.passed = 0
-        self.failed = 0
+        # Keyed by function/check name so re-running a cell overwrites the prior result.
+        self._results: dict[str, tuple[int, int]] = {}  # name -> (passed, failed)
+
+    @property
+    def passed(self):
+        return sum(p for p, _ in self._results.values())
+
+    @property
+    def failed(self):
+        return sum(f for _, f in self._results.values())
 
     def check(self, *args, **kwargs):
         if len(args) == 1 and callable(args[0]):
@@ -48,22 +56,24 @@ class Judge:
         if not tests:
             print(f"⚠️  no tests found for {name!r} in {self.test_module}")
             return
+        passed, failed = 0, 0
         for tname, tfn in tests:
             label = tname[len("test_") + len(name):].lstrip("_") or "default"
             try:
                 tfn(fn)
-                self.passed += 1
+                passed += 1
                 print(f"✅ {name} :: {label}")
             except NotImplementedError:
-                self.failed += 1
+                failed += 1
                 print(f"⏭  {name} :: {label} — not implemented")
             except AssertionError as e:
-                self.failed += 1
+                failed += 1
                 msg = str(e).strip() or "assertion failed"
                 print(f"❌ {name} :: {label}\n   {msg}")
             except Exception:
-                self.failed += 1
+                failed += 1
                 print(f"💥 {name} :: {label}\n{traceback.format_exc()}")
+        self._results[name] = (passed, failed)
 
     def _check_value(self, name, got, expected, tol=None):
         if tol is None:
@@ -81,10 +91,10 @@ class Judge:
         else:
             ok = got == expected
         if ok:
-            self.passed += 1
+            self._results[name] = (1, 0)
             print(f"✅ {name}: PASSED")
         else:
-            self.failed += 1
+            self._results[name] = (0, 1)
             print(f"❌ {name}: FAILED")
             print(f"   got:      {got!r}")
             print(f"   expected: {expected!r}")
