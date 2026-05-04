@@ -186,18 +186,7 @@
 import sys
 import pathlib
 
-# Make the repo root and src/ importable so `from judge import Judge` resolves
-# whether this runs from src/chapters/ (as a .py) or notebooks/ (as a .ipynb).
-_HERE = pathlib.Path.cwd()
-if _HERE.name == "chapters" and _HERE.parent.name == "src":
-    _ROOT = _HERE.parent.parent          # src/chapters/ → repo root
-elif _HERE.name in ("notebooks", "chapters", "src"):
-    _ROOT = _HERE.parent                 # notebooks/ (notebook) → repo root
-else:
-    _ROOT = _HERE                        # already at repo root
-for _p in [str(_ROOT), str(_ROOT / "src")]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+
 
 from judge import Judge
 
